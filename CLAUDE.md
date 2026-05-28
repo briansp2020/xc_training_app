@@ -36,9 +36,15 @@ The app does NOT do analysis, charting, or dashboards. That's the server's job.
 - Sleep
 - Active energy burned
 
+## Android Gotchas
+
+- `MainActivity` must extend `FlutterFragmentActivity`, not `FlutterActivity`. The `health` package uses `registerForActivityResult()` which requires `ComponentActivity`.
+- `Health().configure()` must be called before any other health operations — it registers the permission launcher.
+- Use `Health().hasPermissions()` on startup to detect already-granted permissions instead of forcing the user through the request flow every time.
+
 ## Current State
 
-**Week 1:** Single-screen app that requests Health Connect permissions and reads the most recent heart rate value. No server upload yet.
+**Week 1:** Single-screen app that auto-detects Health Connect permissions, requests them if needed, and reads the most recent heart rate value from the last 24 hours. No server upload yet.
 
 ## Next Steps
 

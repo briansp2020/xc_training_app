@@ -31,7 +31,8 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final Health _health = Health();
 
-  String _status = 'Not connected to Health Connect yet.';
+  String _status = 'Initializing Health Connect...';
+  bool _configured = false;
   bool _permissionsGranted = false;
   String? _heartRateValue;
   String? _heartRateTime;
@@ -44,7 +45,50 @@ class _HomeScreenState extends State<HomeScreen> {
     HealthDataType.ACTIVE_ENERGY_BURNED,
   ];
 
+  @override
+  void initState() {
+    super.initState();
+    _configureHealth();
+  }
+
+  Future<void> _configureHealth() async {
+    try {
+      await _health.configure();
+      _configured = true;
+      await _checkPermissions();
+    } catch (e) {
+      setState(() {
+        _status = 'Error initializing Health Connect: $e';
+      });
+    }
+  }
+
+  Future<void> _checkPermissions() async {
+    try {
+      final hasPermissions = await _health.hasPermissions(
+        _types,
+        permissions: _types.map((_) => HealthDataAccess.READ).toList(),
+      );
+
+      setState(() {
+        _permissionsGranted = hasPermissions ?? false;
+        _status = _permissionsGranted
+            ? 'Permissions granted. Ready to read data!'
+            : 'Tap "Request Permissions" to get started.';
+      });
+    } catch (e) {
+      setState(() {
+        _status = 'Error checking permissions: $e';
+      });
+    }
+  }
+
   Future<void> _requestPermissions() async {
+    if (!_configured) {
+      setState(() => _status = 'Health Connect not ready yet. Please wait...');
+      return;
+    }
+
     setState(() => _status = 'Requesting permissions...');
 
     try {
@@ -68,11 +112,6 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _readHeartRate() async {
-    if (!_permissionsGranted) {
-      setState(() => _status = 'Please request permissions first.');
-      return;
-    }
-
     setState(() => _status = 'Reading heart rate data...');
 
     try {
@@ -140,23 +179,24 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
             const SizedBox(height: 16),
-            FilledButton.icon(
-              onPressed: _requestPermissions,
-              icon: const Icon(Icons.lock_open),
-              label: const Text('Request Permissions'),
-            ),
-            const SizedBox(height: 12),
-            FilledButton.tonal(
-              onPressed: _readHeartRate,
-              child: const Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(Icons.favorite),
-                  SizedBox(width: 8),
-                  Text('Read My Heart Rate'),
-                ],
+            if (!_permissionsGranted)
+              FilledButton.icon(
+                onPressed: _requestPermissions,
+                icon: const Icon(Icons.lock_open),
+                label: const Text('Request Permissions'),
               ),
-            ),
+            if (_permissionsGranted)
+              FilledButton.tonal(
+                onPressed: _readHeartRate,
+                child: const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.favorite),
+                    SizedBox(width: 8),
+                    Text('Read My Heart Rate'),
+                  ],
+                ),
+              ),
             const SizedBox(height: 24),
             if (_heartRateValue != null)
               Card(
