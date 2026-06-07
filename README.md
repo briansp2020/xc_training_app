@@ -1,43 +1,49 @@
 # XC Training Data
 
-A mobile app that collects health and workout data from a runner's phone and uploads it to a server, so a cross country team can analyze training effectiveness.
+A Flutter app that uploads 30 days of raw Health Connect data — heart rate samples, steps, distance, calories, sleep, and any explicit workout records — to a server for cross country team analysis. The client is a thin uploader; all analysis (including detecting workouts from raw HR + cadence) happens server-side.
 
-Currently reads heart rate data from **Health Connect** on Android. iOS support (via HealthKit) is planned.
+Android only for now. iOS support is on the roadmap.
 
 ## Prerequisites
 
-- Flutter 3.44+ ([install guide](https://docs.flutter.dev/get-started/install))
-- Android device running Android 9+ (API 28+) with Health Connect installed
-- USB debugging enabled on the device
+- Flutter 3.44+
+- Android device on API 28+ with Health Connect installed and populated (Fitbit, Strava, Google Fit, Wear OS, etc.)
+- USB debugging enabled
+- A server willing to accept ~15 MB JSON POSTs — see [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md)
 
-## Getting Started
+## Run
 
 ```bash
-# Install dependencies
 flutter pub get
-
-# List connected devices
-flutter devices
-
-# Run on your Android phone
-flutter run -d <your-device-id>
+flutter devices               # confirm your phone is listed
+flutter run -d <device-id>
 ```
 
-## Android Setup Notes
+Update `_serverUrl` at the top of [lib/main.dart](lib/main.dart) to point at your server.
 
-- **MainActivity** must extend `FlutterFragmentActivity` (not `FlutterActivity`) — required by the `health` package for the permission launcher to work.
-- **minSdkVersion** is set to 28 (Android 9) for Health Connect compatibility.
-- Health Connect permissions are declared in `AndroidManifest.xml` for: heart rate, steps, distance, sleep, and active energy burned.
+## Current state
 
-## How It Works
+Working end-to-end on one Android phone:
 
-1. On launch, the app checks if Health Connect permissions are already granted.
-2. If not, tap **"Request Permissions"** to open the Health Connect permissions dialog.
-3. Once granted, tap **"Read My Heart Rate"** to fetch the most recent heart rate reading from the last 24 hours.
+1. Auto-detects/requests Health Connect permissions on launch
+2. Reads 30 days of all 19 supported streams
+3. POSTs as `type: "health_sync"` to the configured server (verified accepted)
 
-## Tech Stack
+The DEBUG ONLY section of the UI also exposes **Discover Workout Data** (dumps last 5 workouts as raw JSON to the `flutter run` console) and **Scan All Data (30d)** (per-type counts and peak-HR-per-day summary) for ad-hoc schema discovery. Both will be removed before shipping.
 
-- **Flutter** (Dart) — cross-platform framework
-- **health** 13.3.1 — reads Health Connect (Android) / HealthKit (iOS)
-- **http** 1.6.0 — for future server uploads
-- **shared_preferences** 2.5.5 — for local state (e.g., last sync time)
+## Roadmap
+
+1. Server-side session detection — recovers Fitbit-tracked sessions that aren't wrapped in `ExerciseSessionRecord` (algorithm in [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md))
+2. Track `last_sync_at` in `shared_preferences` so re-syncs only POST new data
+3. Background sync via WorkManager
+4. Strava OAuth server-side for GPS routes (never in Health Connect)
+5. Multi-athlete: replace hardcoded `_athleteId = 1` with login / device token
+6. iOS support (HealthKit permissions, entitlements, Info.plist)
+7. Remove the debug-only UI section
+8. HTTPS + drop the `usesCleartextTraffic` flag
+
+## Where things live
+
+- [lib/main.dart](lib/main.dart) — the whole app
+- [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md) — upload contract: payload shape, dedup strategy, suggested Postgres tables, session-detection algorithm
+- [CLAUDE.md](CLAUDE.md) — coding conventions and Android/Health Connect gotchas

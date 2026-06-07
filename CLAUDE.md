@@ -1,58 +1,35 @@
-# XC Training Data
+# XC Training Data — developer notes
 
-A mobile app that collects health and workout data from a runner's phone (via Health Connect on Android, HealthKit on iOS) and uploads it to a server for cross country team training analysis. The app is a "tiny uploader" — its only job is to read health data and POST it to a server. All analysis and dashboards happen elsewhere.
+See [README.md](README.md) for what this project is, how to run it, current state, and roadmap. See [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md) for the upload contract.
 
-## Tech Stack
+This file covers things that aren't obvious from reading the code.
 
-- **Framework:** Flutter (Dart) — single codebase targeting Android first, iOS later
-- **Health data:** `health` package (wraps Health Connect on Android, HealthKit on iOS)
-- **HTTP:** `http` package (for future server uploads)
-- **Local storage:** `shared_preferences` (stores simple state like last sync time)
-- **Android language:** Kotlin
-- **iOS language:** Swift
-- **Min Android SDK:** 28 (Android 9+)
+## Tech stack
 
-## Architecture
+- Flutter 3.44, Dart 3.x
+- `health` ^13.3.1 (Health Connect on Android, HealthKit on iOS)
+- `http` ^1.6.0
+- `shared_preferences` ^2.5.5 (declared, not yet used — will hold last-sync timestamp)
+- Kotlin on Android, Swift on iOS, minSdk 28
 
-This app follows a "tiny uploader" pattern:
-1. Read health data from the phone's health platform (Health Connect / HealthKit)
-2. POST the data to a server endpoint
-3. Track what has been synced so we don't re-upload
+## Coding conventions
 
-The app does NOT do analysis, charting, or dashboards. That's the server's job.
-
-## Coding Conventions
-
-- Follow standard Dart style (`dart format`, `flutter analyze` must pass)
+- `dart format` clean, `flutter analyze` must pass
 - Prefer simple, readable code over clever abstractions
-- Show errors to the user on screen — never silently swallow failures
+- Surface errors to the user on screen — never silently swallow
 - Comment only when the "why" is non-obvious
 
-## Health Data Types We Read
+## Server config
 
-- Heart rate
-- Steps
-- Distance
-- Sleep
-- Active energy burned
+`_serverUrl` constant at the top of `lib/main.dart`. From the Android emulator: `http://10.0.2.2:8000/workouts`. From a physical phone: the host's LAN IP (e.g. `http://10.0.0.23:8000/workouts`), and the server must bind to `0.0.0.0`, not `127.0.0.1`. The manifest currently allows cleartext traffic; remove `android:usesCleartextTraffic="true"` when switching to HTTPS.
 
-## Android Gotchas
+## Android / Health Connect gotchas
 
-- `MainActivity` must extend `FlutterFragmentActivity`, not `FlutterActivity`. The `health` package uses `registerForActivityResult()` which requires `ComponentActivity`.
-- `Health().configure()` must be called before any other health operations — it registers the permission launcher.
-- Use `Health().hasPermissions()` on startup to detect already-granted permissions instead of forcing the user through the request flow every time.
+These bit us during development and aren't obvious from the code:
 
-## Current State
-
-**Week 1:** Single-screen app that auto-detects Health Connect permissions, requests them if needed, and reads the most recent heart rate value from the last 24 hours. No server upload yet.
-
-## Next Steps
-
-1. Add remaining health data types to the UI (steps, distance, sleep, calories)
-2. Build a simple server endpoint and implement the POST upload
-3. Add `shared_preferences` tracking for last sync timestamp
-4. Add a "Sync Now" button that reads all new data since last sync and uploads it
-5. Handle background sync (WorkManager on Android)
-6. iOS setup (HealthKit permissions, entitlements, Info.plist)
-7. Add team/athlete identification (so the server knows which runner's data this is)
-8. Polish: loading indicators, sync history, error retry
+- `MainActivity` must extend `FlutterFragmentActivity`, not `FlutterActivity`. The `health` package's permission launcher uses `registerForActivityResult()` which needs a `ComponentActivity`.
+- `Health().configure()` must be called before any other health operations — it registers the permission launcher. Without it you get "Permission launcher not found".
+- Use `Health().hasPermissions()` on startup; don't force re-grant every launch.
+- **Total vs Active calories are separate Health Connect permissions.** The `health` package's workout reader internally queries `TotalCaloriesBurnedRecord`, so the manifest needs `READ_TOTAL_CALORIES_BURNED` even though our Dart code uses `HealthDataType.ACTIVE_ENERGY_BURNED`. Without it, workout reads silently return empty (the package swallows the SecurityException).
+- **Fitbit doesn't always write `ExerciseSessionRecord` for activities it tracks** — treadmill sessions in particular show up only as raw HR + step streams. This is why the server detects sessions from raw signals instead of trusting the explicit workouts list.
+- Pixel Pro Fold has two displays. To screenshot the right one via adb: `screencap -p -d <display-id>`. To keep the screen on during dev: `adb shell settings put global stay_on_while_plugged_in 7`.
