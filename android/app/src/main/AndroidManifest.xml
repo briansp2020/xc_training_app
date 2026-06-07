@@ -1,16 +1,22 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Health Connect permissions -->
+    <!-- Health Connect read permissions.
+         Note: the health package reads TotalCaloriesBurnedRecord (not Active) when
+         aggregating workout calories, so READ_TOTAL_CALORIES_BURNED is required
+         for workout reads to return anything. -->
     <uses-permission android:name="android.permission.health.READ_HEART_RATE"/>
     <uses-permission android:name="android.permission.health.READ_STEPS"/>
     <uses-permission android:name="android.permission.health.READ_DISTANCE"/>
     <uses-permission android:name="android.permission.health.READ_SLEEP"/>
     <uses-permission android:name="android.permission.health.READ_ACTIVE_CALORIES_BURNED"/>
+    <uses-permission android:name="android.permission.health.READ_TOTAL_CALORIES_BURNED"/>
+    <uses-permission android:name="android.permission.health.READ_EXERCISE"/>
 
     <application
         android:label="XC Training Data"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:usesCleartextTraffic="true"><!-- TODO: remove cleartext when server moves to HTTPS -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
