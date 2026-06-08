@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:health/health.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 // Server URL. Use 10.0.2.2 from the Android emulator (its alias for the host
 // machine's localhost), or the host's LAN IP from a physical phone. Change
@@ -12,6 +13,18 @@ const String _serverUrl = 'http://10.0.0.23:8000/workouts';
 // Identifies which runner's data this is. Hardcoded for now; eventually this
 // will come from a login flow or device-side config.
 const int _athleteId = 1;
+
+// shared_preferences key — stores the ISO-8601 UTC timestamp of the most
+// recent successful sync. Next sync uses this as window_start. Falls back to
+// 30 days ago when absent (first run or after a reinstall).
+const String _lastSyncPrefsKey = 'last_sync_at';
+const Duration _firstSyncWindow = Duration(days: 30);
+
+// Re-query a small overlap behind the watermark on every incremental sync,
+// to catch late-arriving Health Connect samples (Fitbit can batch-deliver
+// data 30-60 minutes after the sensor reading happened). Server's UUID
+// upsert dedup makes the duplicates harmless.
+const Duration _watermarkOverlap = Duration(hours: 1);
 
 void main() {
   runApp(const XCTrainingApp());
@@ -488,18 +501,41 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _uploadWorkouts() async {
     setState(() {
       _uploading = true;
-      _status = 'Reading 30 days of data from Health Connect...';
+      _status = 'Reading data from Health Connect...';
     });
 
     try {
+      final prefs = await SharedPreferences.getInstance();
+      final lastSyncIso = prefs.getString(_lastSyncPrefsKey);
       final now = DateTime.now();
-      final windowStart = now.subtract(const Duration(days: 30));
+      final windowStart = lastSyncIso != null
+          ? DateTime.parse(lastSyncIso).subtract(_watermarkOverlap)
+          : now.subtract(_firstSyncWindow);
+      final windowDays =
+          now.difference(windowStart).inMinutes / (60 * 24);
+      final windowLabel = lastSyncIso != null
+          ? 'since last sync (${windowDays.toStringAsFixed(1)} days)'
+          : 'full ${_firstSyncWindow.inDays}-day window (first sync)';
+
+      // Track the newest dateTo we see across every record we upload, and
+      // use that (not `now`) as the next watermark — so the next sync picks
+      // up exactly where the data left off, even if Health Connect has gaps
+      // or hasn't indexed very-recent samples yet.
+      DateTime? maxSampleTime;
+      void trackMax(DateTime t) {
+        if (maxSampleTime == null || t.isAfter(maxSampleTime!)) {
+          maxSampleTime = t;
+        }
+      }
 
       // Read workouts (they're useful as ground truth when Fitbit DOES
       // wrap activity in ExerciseSessionRecord; server uses them and the
       // raw streams together).
       final workouts = await _safeRead(
           HealthDataType.WORKOUT, windowStart, now);
+      for (final w in workouts) {
+        trackMax(w.dateTo);
+      }
 
       final workoutPayloads = workouts.map((w) {
         final v = w.value;
@@ -538,12 +574,18 @@ class _HomeScreenState extends State<HomeScreen> {
       for (final e in _numericStreams.entries) {
         setState(() => _status = 'Reading ${e.key}...');
         final samples = await _safeRead(e.value, windowStart, now);
+        for (final s in samples) {
+          trackMax(s.dateTo);
+        }
         payload[e.key] = samples.map(_numericSample).toList();
         totalSamples += samples.length;
       }
       for (final e in _intervalStreams.entries) {
         setState(() => _status = 'Reading ${e.key}...');
         final samples = await _safeRead(e.value, windowStart, now);
+        for (final s in samples) {
+          trackMax(s.dateTo);
+        }
         payload[e.key] = samples.map(_intervalSample).toList();
         totalSamples += samples.length;
       }
@@ -561,11 +603,21 @@ class _HomeScreenState extends State<HomeScreen> {
           )
           .timeout(const Duration(seconds: 120));
 
+      final ok = response.statusCode >= 200 && response.statusCode < 300;
+      if (ok && maxSampleTime != null) {
+        // Only advance the watermark on a successful 2xx AND when we
+        // actually uploaded something. If the sync was empty, leave the
+        // watermark alone so the next sync re-queries the same window —
+        // that way delayed Health Connect inserts can still be picked up.
+        await prefs.setString(
+            _lastSyncPrefsKey, maxSampleTime!.toUtc().toIso8601String());
+      }
+
       setState(() {
         _uploading = false;
-        if (response.statusCode >= 200 && response.statusCode < 300) {
+        if (ok) {
           _status =
-              'Synced $sizeMB MB (${workouts.length} workouts, $totalSamples samples). Server: ${response.statusCode}.';
+              'Synced $sizeMB MB ($windowLabel): ${workouts.length} workouts, $totalSamples samples. Server: ${response.statusCode}.';
         } else {
           _status =
               'Upload failed: ${response.statusCode}\n${response.body}';
