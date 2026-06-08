@@ -225,7 +225,7 @@ def detect_sessions(hr_samples, step_samples,
 `source_uuid` is the dedup key for workouts. For samples the key depends on the stream:
 
 - **Heart rate → `(uuid, time)`.** A Health Connect `HeartRateRecord` is a *series*: one record (one `uuid`) carries many timestamped readings, so `uuid` alone is **not** unique per reading — deduping on it would collapse the whole series into one row. (Observed in real data: ~165k HR readings shared only ~6.7k uuids.)
-- **Interval streams (steps, distance, calories, sleep, …) → `uuid`.** These are one record per reading, so `uuid` alone is unique.
+- **Interval streams → `(uuid, stream, start_time)`.** Steps/distance/calories have unique uuids, but a `SleepSessionRecord` decomposes into per-stage rows (DEEP/REM/LIGHT/AWAKE plus the session itself) that **all share the parent session's uuid** — so `uuid` alone would collapse a whole night into one row. (Observed: a session row and its first DEEP row shared `81694f2a-…`.) The composite key is safe for every interval stream.
 
 ```sql
 -- heart rate: composite key (uuid, time)
@@ -235,9 +235,9 @@ ON CONFLICT (uuid, time) DO UPDATE SET
   bpm = EXCLUDED.bpm,
   source = EXCLUDED.source;
 
--- interval streams: uuid alone
-INSERT INTO interval_samples (uuid, ...) VALUES (...)
-ON CONFLICT (uuid) DO UPDATE SET value = EXCLUDED.value, ...;
+-- interval streams: composite key (sleep stages share the session uuid)
+INSERT INTO interval_samples (uuid, stream, start_time, ...) VALUES (...)
+ON CONFLICT (uuid, stream, start_time) DO UPDATE SET value = EXCLUDED.value, ...;
 ```
 
 Re-uploads with the same keys idempotently update. The client syncs incrementally: it tracks the newest `dateTo` of any record it uploaded as a watermark in `shared_preferences`, then on the next sync re-queries `[watermark - 1 hour, now]`. The 1-hour overlap re-reads the tail of the previous window so Health Connect inserts that arrive late (e.g. Fitbit batching HR 30–60 minutes after the fact) still get captured — and your composite-key dedup is what makes that overlap free. Empty syncs (no new records) leave the watermark alone, so the next attempt re-queries the same window. First-run / post-reinstall syncs fall back to a 30-day window.
@@ -304,15 +304,16 @@ CREATE TABLE heart_rate_samples (
 CREATE INDEX ON heart_rate_samples (athlete_id, time);
 
 CREATE TABLE interval_samples (    -- one table for all interval streams
-  uuid       UUID PRIMARY KEY,
-  athlete_id INTEGER NOT NULL,
-  stream     TEXT NOT NULL,         -- "step", "distance", "total_calorie", ...
+  uuid       UUID NOT NULL,         -- sleep stages share the session's uuid
+  stream     TEXT NOT NULL,         -- "step", "distance", "sleep_deep", ...
   start_time TIMESTAMPTZ NOT NULL,
+  athlete_id INTEGER NOT NULL,
   end_time   TIMESTAMPTZ NOT NULL,
   value      DOUBLE PRECISION NOT NULL,
   unit       TEXT NOT NULL,
   source     TEXT,
-  recording_method TEXT
+  recording_method TEXT,
+  PRIMARY KEY (uuid, stream, start_time)
 );
 CREATE INDEX ON interval_samples (athlete_id, stream, start_time);
 
