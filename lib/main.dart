@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:health/health.dart';
 import 'package:http/http.dart' as http;
@@ -13,6 +14,10 @@ const String _serverUrl = 'http://10.0.0.23:8000/workouts';
 // Identifies which runner's data this is. Hardcoded for now; eventually this
 // will come from a login flow or device-side config.
 const int _athleteId = 1;
+
+// Reported in every sync payload so the server can tell which client emitted
+// it. Must match `version` in pubspec.yaml — bump both together.
+const String _clientVersion = '1.0.0+1';
 
 // shared_preferences key — stores the ISO-8601 UTC timestamp of the most
 // recent successful sync. Next sync uses this as window_start. Falls back to
@@ -63,18 +68,32 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _heartRateValue;
   String? _heartRateTime;
 
+  // Single source of truth for what the sync reads + what we request permission
+  // for. Must match the manifest's READ_* declarations and the union of
+  // _numericStreams + _intervalStreams + [WORKOUT].
   final List<HealthDataType> _types = [
+    // Core training signals
     HealthDataType.HEART_RATE,
     HealthDataType.STEPS,
     HealthDataType.DISTANCE_DELTA,
-    HealthDataType.SLEEP_ASLEEP,
     HealthDataType.ACTIVE_ENERGY_BURNED,
     // TOTAL_CALORIES_BURNED is required even though we never directly read
-    // it: the health package's WORKOUT reader internally queries
-    // TotalCaloriesBurnedRecord to aggregate calories, and the read throws
-    // SecurityException (returning an empty list) without this permission.
+    // it via this list: the health package's WORKOUT reader internally
+    // queries TotalCaloriesBurnedRecord to aggregate calories, and the read
+    // returns empty without this permission.
     HealthDataType.TOTAL_CALORIES_BURNED,
     HealthDataType.WORKOUT,
+    // Recovery / fitness extras
+    HealthDataType.HEART_RATE_VARIABILITY_RMSSD,
+    HealthDataType.RESTING_HEART_RATE,
+    HealthDataType.RESPIRATORY_RATE,
+    // Sleep — READ_SLEEP covers SLEEP_ASLEEP and the stage types.
+    HealthDataType.SLEEP_ASLEEP,
+    HealthDataType.SLEEP_SESSION,
+    HealthDataType.SLEEP_DEEP,
+    HealthDataType.SLEEP_REM,
+    HealthDataType.SLEEP_LIGHT,
+    HealthDataType.SLEEP_AWAKE,
   ];
 
   // All types are READ-only. The debug "Insert Test Workout" button no longer
@@ -92,9 +111,11 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _configureHealth() async {
     try {
       await _health.configure();
+      if (!mounted) return;
       _configured = true;
       await _checkPermissions();
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _status = 'Error initializing Health Connect: $e';
       });
@@ -107,6 +128,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _types,
         permissions: _permissions,
       );
+      if (!mounted) return;
 
       setState(() {
         _permissionsGranted = hasPermissions ?? false;
@@ -115,6 +137,7 @@ class _HomeScreenState extends State<HomeScreen> {
             : 'Tap "Request Permissions" to get started.';
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _status = 'Error checking permissions: $e';
       });
@@ -134,6 +157,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _types,
         permissions: _permissions,
       );
+      if (!mounted) return;
 
       setState(() {
         _permissionsGranted = requested;
@@ -142,6 +166,7 @@ class _HomeScreenState extends State<HomeScreen> {
             : 'Permissions denied. Open Health Connect settings to grant access.';
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _status = 'Error requesting permissions: $e';
         _permissionsGranted = false;
@@ -208,6 +233,7 @@ class _HomeScreenState extends State<HomeScreen> {
         endTime: now,
       );
 
+      if (!mounted) return;
       if (workouts.isEmpty) {
         debugPrint('[DISCOVERY] No workouts found in last 90 days.');
         setState(() => _status = 'No workouts found. See console.');
@@ -272,9 +298,11 @@ class _HomeScreenState extends State<HomeScreen> {
       debugPrint('[DISCOVERY] Complete.');
       debugPrint('$bar\n');
 
+      if (!mounted) return;
       setState(() => _status =
           'Discovery complete: ${recent.length} workout(s) dumped. Check console.');
     } catch (e) {
+      if (!mounted) return;
       setState(() => _status = 'Discovery error: $e');
     }
   }
@@ -422,10 +450,12 @@ class _HomeScreenState extends State<HomeScreen> {
       debugPrint('[ALL DATA] Complete');
       debugPrint(bar);
 
+      if (!mounted) return;
       final nonEmpty = results.entries.where((e) => e.value.isNotEmpty).length;
       setState(() => _status =
           'Scan complete: $nonEmpty/${allTypes.length} types had data. Check console.');
     } catch (e) {
+      if (!mounted) return;
       setState(() => _status = 'Scan error: $e');
     }
   }
@@ -463,7 +493,10 @@ class _HomeScreenState extends State<HomeScreen> {
         startTime: start,
         endTime: end,
       );
-    } catch (_) {
+    } catch (e, st) {
+      // Don't crash the caller — expected for unpermissioned types — but
+      // log so it's still visible in the dev console.
+      debugPrint('[_safeRead] ${t.name} failed: $e\n$st');
       return [];
     }
   }
@@ -472,15 +505,14 @@ class _HomeScreenState extends State<HomeScreen> {
   // any workout container. The server detects exercise sessions from the
   // raw HR + step traces, so we need everything inside the window regardless
   // of whether Fitbit wrapped it in an ExerciseSessionRecord.
+  //
+  // Every type in these maps MUST be in `_types` (and the manifest must
+  // declare the matching READ_* permission), or the read returns empty.
   static const Map<String, HealthDataType> _numericStreams = {
     'heart_rate_samples': HealthDataType.HEART_RATE,
-    'speed_samples': HealthDataType.SPEED,
     'hrv_rmssd_samples': HealthDataType.HEART_RATE_VARIABILITY_RMSSD,
     'resting_heart_rate_samples': HealthDataType.RESTING_HEART_RATE,
     'respiratory_rate_samples': HealthDataType.RESPIRATORY_RATE,
-    'blood_oxygen_samples': HealthDataType.BLOOD_OXYGEN,
-    'skin_temperature_samples': HealthDataType.SKIN_TEMPERATURE,
-    'body_temperature_samples': HealthDataType.BODY_TEMPERATURE,
   };
 
   static const Map<String, HealthDataType> _intervalStreams = {
@@ -488,9 +520,6 @@ class _HomeScreenState extends State<HomeScreen> {
     'distance_samples': HealthDataType.DISTANCE_DELTA,
     'total_calorie_samples': HealthDataType.TOTAL_CALORIES_BURNED,
     'active_energy_samples': HealthDataType.ACTIVE_ENERGY_BURNED,
-    'basal_energy_samples': HealthDataType.BASAL_ENERGY_BURNED,
-    'flights_climbed_samples': HealthDataType.FLIGHTS_CLIMBED,
-    'activity_intensity_samples': HealthDataType.ACTIVITY_INTENSITY,
     'sleep_sessions': HealthDataType.SLEEP_SESSION,
     'sleep_deep_samples': HealthDataType.SLEEP_DEEP,
     'sleep_rem_samples': HealthDataType.SLEEP_REM,
@@ -498,7 +527,7 @@ class _HomeScreenState extends State<HomeScreen> {
     'sleep_awake_samples': HealthDataType.SLEEP_AWAKE,
   };
 
-  Future<void> _uploadWorkouts() async {
+  Future<void> _syncHealthData() async {
     setState(() {
       _uploading = true;
       _status = 'Reading data from Health Connect...';
@@ -506,13 +535,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
     try {
       final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
       final lastSyncIso = prefs.getString(_lastSyncPrefsKey);
       final now = DateTime.now();
       final windowStart = lastSyncIso != null
           ? DateTime.parse(lastSyncIso).subtract(_watermarkOverlap)
           : now.subtract(_firstSyncWindow);
-      final windowDays =
-          now.difference(windowStart).inMinutes / (60 * 24);
+      final windowDays = now.difference(windowStart).inMinutes / (60 * 24);
       final windowLabel = lastSyncIso != null
           ? 'since last sync (${windowDays.toStringAsFixed(1)} days)'
           : 'full ${_firstSyncWindow.inDays}-day window (first sync)';
@@ -528,41 +557,67 @@ class _HomeScreenState extends State<HomeScreen> {
         }
       }
 
-      // Read workouts (they're useful as ground truth when Fitbit DOES
-      // wrap activity in ExerciseSessionRecord; server uses them and the
-      // raw streams together).
-      final workouts = await _safeRead(
-          HealthDataType.WORKOUT, windowStart, now);
+      // Workouts go through the package's special WORKOUT path (it
+      // aggregates distance/calories/steps from related records). Keep
+      // it as a separate read.
+      final workouts =
+          await _safeRead(HealthDataType.WORKOUT, windowStart, now);
+      if (!mounted) return;
       for (final w in workouts) {
         trackMax(w.dateTo);
       }
 
       final workoutPayloads = workouts.map((w) {
-        final v = w.value;
+        final wv = w.value is WorkoutHealthValue
+            ? w.value as WorkoutHealthValue
+            : null;
         return <String, dynamic>{
           'source_uuid': w.uuid,
           'source_app': w.sourceName,
           'source_device_id': w.sourceDeviceId,
-          'activity_type': v is WorkoutHealthValue
-              ? v.workoutActivityType.name
-              : 'OTHER',
+          'activity_type': wv?.workoutActivityType.name ?? 'OTHER',
           'recording_method': w.recordingMethod.name,
           'start_time': w.dateFrom.toUtc().toIso8601String(),
           'end_time': w.dateTo.toUtc().toIso8601String(),
           'duration_seconds': w.dateTo.difference(w.dateFrom).inSeconds,
-          'total_distance_meters':
-              v is WorkoutHealthValue ? v.totalDistance : null,
-          'total_energy_kcal':
-              v is WorkoutHealthValue ? v.totalEnergyBurned : null,
-          'total_steps': v is WorkoutHealthValue ? v.totalSteps : null,
+          'total_distance_meters': wv?.totalDistance,
+          'total_energy_kcal': wv?.totalEnergyBurned,
+          'total_steps': wv?.totalSteps,
         };
       }).toList();
 
-      // Pull every relevant raw stream across the whole window.
+      // Batch every non-workout stream into a single Health Connect query.
+      // Far fewer Kotlin round-trips than reading each type individually.
+      final allStreamTypes = <HealthDataType>{
+        ..._numericStreams.values,
+        ..._intervalStreams.values,
+      }.toList();
+      setState(
+          () => _status = 'Reading ${allStreamTypes.length} streams in one batch...');
+      List<HealthDataPoint> allSamples;
+      try {
+        allSamples = await _health.getHealthDataFromTypes(
+          types: allStreamTypes,
+          startTime: windowStart,
+          endTime: now,
+        );
+      } catch (e, st) {
+        debugPrint('[sync] batch read failed: $e\n$st');
+        allSamples = [];
+      }
+      if (!mounted) return;
+
+      // Bucket by type so we can populate the per-stream payload arrays.
+      final byType = <HealthDataType, List<HealthDataPoint>>{};
+      for (final s in allSamples) {
+        byType.putIfAbsent(s.type, () => []).add(s);
+        trackMax(s.dateTo);
+      }
+
       final payload = <String, dynamic>{
         'type': 'health_sync',
         'athlete_id': _athleteId,
-        'client_version': '1.0.0+1',
+        'client_version': _clientVersion,
         'uploaded_at': now.toUtc().toIso8601String(),
         'source_platform': 'googleHealthConnect',
         'window_start': windowStart.toUtc().toIso8601String(),
@@ -572,20 +627,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
       int totalSamples = 0;
       for (final e in _numericStreams.entries) {
-        setState(() => _status = 'Reading ${e.key}...');
-        final samples = await _safeRead(e.value, windowStart, now);
-        for (final s in samples) {
-          trackMax(s.dateTo);
-        }
+        final samples = byType[e.value] ?? const [];
         payload[e.key] = samples.map(_numericSample).toList();
         totalSamples += samples.length;
       }
       for (final e in _intervalStreams.entries) {
-        setState(() => _status = 'Reading ${e.key}...');
-        final samples = await _safeRead(e.value, windowStart, now);
-        for (final s in samples) {
-          trackMax(s.dateTo);
-        }
+        final samples = byType[e.value] ?? const [];
         payload[e.key] = samples.map(_intervalSample).toList();
         totalSamples += samples.length;
       }
@@ -602,6 +649,7 @@ class _HomeScreenState extends State<HomeScreen> {
             body: bodyBytes,
           )
           .timeout(const Duration(seconds: 120));
+      if (!mounted) return;
 
       final ok = response.statusCode >= 200 && response.statusCode < 300;
       if (ok && maxSampleTime != null) {
@@ -611,6 +659,7 @@ class _HomeScreenState extends State<HomeScreen> {
         // that way delayed Health Connect inserts can still be picked up.
         await prefs.setString(
             _lastSyncPrefsKey, maxSampleTime!.toUtc().toIso8601String());
+        if (!mounted) return;
       }
 
       setState(() {
@@ -619,11 +668,11 @@ class _HomeScreenState extends State<HomeScreen> {
           _status =
               'Synced $sizeMB MB ($windowLabel): ${workouts.length} workouts, $totalSamples samples. Server: ${response.statusCode}.';
         } else {
-          _status =
-              'Upload failed: ${response.statusCode}\n${response.body}';
+          _status = 'Upload failed: ${response.statusCode}\n${response.body}';
         }
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _uploading = false;
         _status = 'Sync error: $e';
@@ -643,6 +692,7 @@ class _HomeScreenState extends State<HomeScreen> {
         startTime: yesterday,
         endTime: now,
       );
+      if (!mounted) return;
 
       if (data.isEmpty) {
         setState(() {
@@ -663,6 +713,7 @@ class _HomeScreenState extends State<HomeScreen> {
             'Heart rate data loaded (${data.length} readings in last 24h).';
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _status = 'Error reading heart rate: $e';
         _heartRateValue = null;
@@ -720,7 +771,7 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 12),
             if (_permissionsGranted)
               FilledButton(
-                onPressed: _uploading ? null : _uploadWorkouts,
+                onPressed: _uploading ? null : _syncHealthData,
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
@@ -736,15 +787,16 @@ class _HomeScreenState extends State<HomeScreen> {
                     else
                       const Icon(Icons.cloud_upload),
                     const SizedBox(width: 8),
-                    Text(_uploading ? 'Uploading...' : 'Sync Workouts to Server'),
+                    Text(_uploading ? 'Uploading...' : 'Sync to Server'),
                   ],
                 ),
               ),
             const SizedBox(height: 24),
             // ============================================================
-            // DEBUG ONLY — remove this whole section before shipping.
+            // DEBUG ONLY — hidden in release builds (kDebugMode = false).
+            // Remove the methods + this whole section before final ship.
             // ============================================================
-            if (_permissionsGranted)
+            if (kDebugMode && _permissionsGranted)
               Container(
                 decoration: BoxDecoration(
                   border: Border.all(color: Colors.orange, width: 2),
