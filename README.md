@@ -34,13 +34,12 @@ The DEBUG ONLY section of the UI also exposes **Discover Workout Data** (dumps l
 ## Roadmap
 
 1. Server-side session detection — recovers Fitbit-tracked sessions that aren't wrapped in `ExerciseSessionRecord` (algorithm in [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md))
-2. Track `last_sync_at` in `shared_preferences` so re-syncs only POST new data
-3. Background sync via WorkManager
-4. Strava OAuth server-side for GPS routes (never in Health Connect)
-5. Multi-athlete: replace hardcoded `_athleteId = 1` with login / device token
-6. iOS support (HealthKit permissions, entitlements, Info.plist)
-7. Remove the debug-only UI section
-8. HTTPS + drop the `usesCleartextTraffic` flag
+2. Background sync via WorkManager
+3. Strava OAuth server-side for GPS routes (never in Health Connect)
+4. Multi-athlete: replace hardcoded `_athleteId = 1` with login / device token
+5. iOS support (HealthKit permissions, entitlements, Info.plist)
+6. Remove the debug-only UI section
+7. HTTPS + drop the `usesCleartextTraffic` flag
 
 ## Where things live
 

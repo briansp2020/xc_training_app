@@ -208,6 +208,7 @@ def detect_sessions(hr_samples, step_samples,
 ### Tuning notes
 - **HR threshold is athlete-specific.** Stash `resting_hr` and `max_hr` per athlete (220-age is fine as a starting heuristic). Falling back to a fixed 130 BPM works OK for the cross country team age range.
 - **Smooth before thresholding.** 1-Hz HR is noisy; a 5-sample rolling median kills spikes from sensor artifacts.
+- **Dedup steps by source before computing cadence.** Steps arrive from several sources at once (Fitbit + Android + Health Connect's aggregator) that redundantly count the *same* steps, often with overlapping records — summing them roughly **doubles** cadence. Pick one primary source (e.g. the wrist tracker — in practice the source with the most records) and take the largest record per minute; don't sum across sources.
 - **Walk-vs-run cutoff is roughly 150 spm cadence.** Treadmill walks land 80-110; runs land 160-185.
 - **Reconcile with the `workouts` array.** If a detected session's window overlaps an explicit workout, prefer the explicit `activity_type` and use the session's HR/step stats to enrich it. If a detected session has no matching explicit workout, you've recovered a Fitbit-untagged treadmill session — exactly the case that motivated this design.
 - **Recurring false-positives.** Long brisk walks will trip the threshold; that's correct behavior — capture them and let the user classify on the dashboard if it matters.
@@ -221,18 +222,25 @@ def detect_sessions(hr_samples, step_samples,
 
 ## Dedup
 
-`source_uuid` on each workout and `uuid` on each sample is the dedup key. Recommended:
+`source_uuid` is the dedup key for workouts. For samples the key depends on the stream:
+
+- **Heart rate → `(uuid, time)`.** A Health Connect `HeartRateRecord` is a *series*: one record (one `uuid`) carries many timestamped readings, so `uuid` alone is **not** unique per reading — deduping on it would collapse the whole series into one row. (Observed in real data: ~165k HR readings shared only ~6.7k uuids.)
+- **Interval streams (steps, distance, calories, sleep, …) → `uuid`.** These are one record per reading, so `uuid` alone is unique.
 
 ```sql
-INSERT INTO heart_rate_samples (uuid, athlete_id, time, bpm, source, recording_method, raw)
+-- heart rate: composite key (uuid, time)
+INSERT INTO heart_rate_samples (uuid, athlete_id, time, bpm, source, recording_method)
 VALUES (...)
-ON CONFLICT (uuid) DO UPDATE SET
+ON CONFLICT (uuid, time) DO UPDATE SET
   bpm = EXCLUDED.bpm,
-  source = EXCLUDED.source,
-  raw = EXCLUDED.raw;
+  source = EXCLUDED.source;
+
+-- interval streams: uuid alone
+INSERT INTO interval_samples (uuid, ...) VALUES (...)
+ON CONFLICT (uuid) DO UPDATE SET value = EXCLUDED.value, ...;
 ```
 
-Same for every typed table. Re-uploads with the same UUIDs idempotently update. The client re-uploads the full 30-day window every time; eventually it'll track a last-sync timestamp and only send new data, but UUID dedup remains the source of truth.
+Re-uploads with the same keys idempotently update. The client syncs incrementally: it tracks the newest `dateTo` of any record it uploaded as a watermark in `shared_preferences`, then on the next sync re-queries `[watermark - 1 hour, now]`. The 1-hour overlap re-reads the tail of the previous window so Health Connect inserts that arrive late (e.g. Fitbit batching HR 30–60 minutes after the fact) still get captured — and your composite-key dedup is what makes that overlap free. Empty syncs (no new records) leave the watermark alone, so the next attempt re-queries the same window. First-run / post-reinstall syncs fall back to a 30-day window.
 
 ---
 
@@ -285,12 +293,13 @@ CREATE TABLE workouts (
 CREATE INDEX ON workouts (athlete_id, start_time DESC);
 
 CREATE TABLE heart_rate_samples (
-  uuid       UUID PRIMARY KEY,
+  uuid       UUID NOT NULL,        -- shared across a HeartRateRecord series
   athlete_id INTEGER NOT NULL,
   time       TIMESTAMPTZ NOT NULL,
   bpm        INTEGER NOT NULL,
   source     TEXT,
-  recording_method TEXT
+  recording_method TEXT,
+  PRIMARY KEY (uuid, time)         -- uuid alone is NOT unique per reading
 );
 CREATE INDEX ON heart_rate_samples (athlete_id, time);
 
@@ -420,7 +429,6 @@ async def post_sync(payload: HealthSync):
 
 ## Future work
 
-- **Last-sync timestamp** in `shared_preferences` so re-syncs only send new data (saves bandwidth + battery once the v0 round-trip is proven).
 - **Background sync** via WorkManager (no need to open the app).
 - **Strava OAuth server-side** for GPS routes (Health Connect never has them).
 - **More permissions** (HRV, resting HR, respiratory rate) for richer recovery analysis. Today the manifest only declares what the v1 scan needs.
