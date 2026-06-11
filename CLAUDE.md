@@ -21,7 +21,13 @@ This file covers things that aren't obvious from reading the code.
 
 ## Server config
 
-`_serverUrl` constant at the top of `lib/main.dart`. From the Android emulator: `http://10.0.2.2:8000/workouts`. From a physical phone: the host's LAN IP (e.g. `http://10.0.0.23:8000/workouts`), and the server must bind to `0.0.0.0`, not `127.0.0.1`. The manifest currently allows cleartext traffic; remove `android:usesCleartextTraffic="true"` when switching to HTTPS.
+`_serverUrl` in `lib/main.dart` is read from a `--dart-define` at build time:
+
+```
+flutter run --dart-define-from-file=config/dev.json -d <device-id>
+```
+
+`config/dev.json` is per-developer and gitignored; copy `config/dev.json.example` to start. The default (when no flag is passed) is `http://10.0.2.2:8000/workouts` — the Android emulator's alias for the host's localhost. From a physical phone use the host's LAN IP (e.g. `http://10.0.0.23:8000/workouts`), and the server must bind to `0.0.0.0`, not `127.0.0.1`. The manifest currently allows cleartext traffic; remove `android:usesCleartextTraffic="true"` when switching to HTTPS.
 
 ## Android / Health Connect gotchas
 

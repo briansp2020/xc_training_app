@@ -13,7 +13,7 @@ The client is a thin uploader. It does **not** aggregate, smooth, classify, or c
 | | |
 |---|---|
 | Method | `POST` |
-| URL | `http://10.0.0.23:8000/workouts` (configurable in `lib/main.dart` via `_serverUrl`) |
+| URL | Build-time `--dart-define=SERVER_URL=...` (see `config/dev.json.example`). Defaults to `http://10.0.2.2:8000/workouts` (the Android emulator's alias for the host's localhost). |
 | Content-Type | `application/json` |
 | Body encoding | UTF-8 JSON |
 | Timeout (client) | 120 seconds |

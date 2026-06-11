@@ -57,3 +57,7 @@ app.*.map.json
 
 # Personal health-data exports (Export to File debug button writes these)
 health_export*.json
+
+# Per-developer dart-define overrides — example is tracked, real values aren't
+config/dev.json
+config/local.json

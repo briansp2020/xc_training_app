@@ -8,10 +8,15 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-// Server URL. Use 10.0.2.2 from the Android emulator (its alias for the host
-// machine's localhost), or the host's LAN IP from a physical phone. Change
-// when you move to a real server / domain.
-const String _serverUrl = 'http://10.0.0.23:8000/workouts';
+// Server URL. Override at run time:
+//   flutter run --dart-define-from-file=config/dev.json
+// (see config/dev.json.example for the schema). The default value below is
+// the Android emulator's alias for the host machine's localhost — safe as a
+// fall-back for someone freshly cloning the repo.
+const String _serverUrl = String.fromEnvironment(
+  'SERVER_URL',
+  defaultValue: 'http://10.0.2.2:8000/workouts',
+);
 
 // Identifies which runner's data this is. Hardcoded for now; eventually this
 // will come from a login flow or device-side config.
