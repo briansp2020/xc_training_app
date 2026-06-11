@@ -1,9 +1,11 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:health/health.dart';
 import 'package:http/http.dart' as http;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 // Server URL. Use 10.0.2.2 from the Android emulator (its alias for the host
@@ -460,6 +462,364 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  // ============================================================
+  // DEBUG ONLY — Export current Health Connect data to a JSON file
+  // on external storage. Use case: pull the file via adb and push it
+  // into an emulator for testing the server's session-detection
+  // algorithm against real data without re-syncing the phone.
+  //
+  // Output: /storage/emulated/0/Android/data/com.example.xctraining/files/health_export.json
+  // ============================================================
+  Future<void> _exportToFile() async {
+    setState(() {
+      _uploading = true;
+      _status = 'Reading 30 days for export...';
+    });
+
+    try {
+      final now = DateTime.now();
+      final windowStart = now.subtract(_firstSyncWindow);
+
+      final workouts =
+          await _safeRead(HealthDataType.WORKOUT, windowStart, now);
+      if (!mounted) return;
+
+      final workoutPayloads = workouts.map((w) {
+        final wv = w.value is WorkoutHealthValue
+            ? w.value as WorkoutHealthValue
+            : null;
+        return <String, dynamic>{
+          'source_uuid': w.uuid,
+          'source_app': w.sourceName,
+          'source_device_id': w.sourceDeviceId,
+          'activity_type': wv?.workoutActivityType.name ?? 'OTHER',
+          'recording_method': w.recordingMethod.name,
+          'start_time': w.dateFrom.toUtc().toIso8601String(),
+          'end_time': w.dateTo.toUtc().toIso8601String(),
+          'duration_seconds': w.dateTo.difference(w.dateFrom).inSeconds,
+          'total_distance_meters': wv?.totalDistance,
+          'total_energy_kcal': wv?.totalEnergyBurned,
+          'total_steps': wv?.totalSteps,
+        };
+      }).toList();
+
+      final allStreamTypes = <HealthDataType>{
+        ..._numericStreams.values,
+        ..._intervalStreams.values,
+      }.toList();
+      setState(() => _status = 'Reading all streams (export)...');
+      List<HealthDataPoint> allSamples;
+      try {
+        allSamples = await _health.getHealthDataFromTypes(
+          types: allStreamTypes,
+          startTime: windowStart,
+          endTime: now,
+        );
+      } catch (e, st) {
+        debugPrint('[export] batch read failed: $e\n$st');
+        allSamples = [];
+      }
+      if (!mounted) return;
+
+      final byType = <HealthDataType, List<HealthDataPoint>>{};
+      for (final s in allSamples) {
+        byType.putIfAbsent(s.type, () => []).add(s);
+      }
+
+      final payload = <String, dynamic>{
+        'type': 'health_sync',
+        'athlete_id': _athleteId,
+        'client_version': _clientVersion,
+        'uploaded_at': now.toUtc().toIso8601String(),
+        'source_platform': 'googleHealthConnect',
+        'window_start': windowStart.toUtc().toIso8601String(),
+        'window_end': now.toUtc().toIso8601String(),
+        'workouts': workoutPayloads,
+      };
+
+      int totalSamples = 0;
+      for (final e in _numericStreams.entries) {
+        final samples = byType[e.value] ?? const [];
+        payload[e.key] = samples.map(_numericSample).toList();
+        totalSamples += samples.length;
+      }
+      for (final e in _intervalStreams.entries) {
+        final samples = byType[e.value] ?? const [];
+        payload[e.key] = samples.map(_intervalSample).toList();
+        totalSamples += samples.length;
+      }
+
+      final dir = await getExternalStorageDirectory();
+      if (!mounted) return;
+      if (dir == null) {
+        throw Exception('External storage directory unavailable');
+      }
+      final file = File('${dir.path}/health_export.json');
+      // Compact (not indented) — the file is just for transfer.
+      await file.writeAsString(jsonEncode(payload), flush: true);
+      if (!mounted) return;
+
+      final sizeMB = (await file.length() / 1024 / 1024).toStringAsFixed(2);
+      setState(() {
+        _uploading = false;
+        _status = 'Exported $sizeMB MB '
+            '(${workouts.length} workouts, $totalSamples samples) to:\n'
+            '${file.path}';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _uploading = false;
+        _status = 'Export error: $e';
+      });
+    }
+  }
+
+  // ============================================================
+  // DEBUG ONLY — Read the export file and replay it into Health
+  // Connect via the health package's write APIs. Intended for use
+  // on an emulator that has just been wiped; running it on a phone
+  // that already has the data will create duplicates (Health
+  // Connect doesn't dedup by our UUIDs — it assigns its own on
+  // write).
+  //
+  // Types we can write: HEART_RATE, STEPS, DISTANCE_DELTA,
+  // ACTIVE_ENERGY_BURNED, TOTAL_CALORIES_BURNED, SLEEP_SESSION, and
+  // WORKOUT. The other streams (HRV, resting HR, respiratory rate,
+  // sleep stages) get skipped — the package doesn't expose writes
+  // for them today. We log the skips so it's obvious in the
+  // console what didn't round-trip.
+  // ============================================================
+  Future<void> _importFromFile() async {
+    setState(() {
+      _uploading = true;
+      _status = 'Reading import file...';
+    });
+
+    try {
+      final dir = await getExternalStorageDirectory();
+      if (!mounted) return;
+      if (dir == null) {
+        throw Exception('External storage directory unavailable');
+      }
+      final file = File('${dir.path}/health_export.json');
+      if (!await file.exists()) {
+        if (!mounted) return;
+        setState(() {
+          _uploading = false;
+          _status = 'No import file at:\n${file.path}\n\n'
+              'Push one via adb:\n'
+              'adb push health_export.json ${file.path}';
+        });
+        return;
+      }
+
+      final raw = await file.readAsString();
+      if (!mounted) return;
+      final payload = jsonDecode(raw) as Map<String, dynamic>;
+
+      // Request WRITE permission for what we plan to write. Lives in the
+      // debug manifest only — release builds can't even ask for these.
+      const writeTypes = <HealthDataType>[
+        HealthDataType.HEART_RATE,
+        HealthDataType.STEPS,
+        HealthDataType.DISTANCE_DELTA,
+        HealthDataType.ACTIVE_ENERGY_BURNED,
+        HealthDataType.TOTAL_CALORIES_BURNED,
+        HealthDataType.SLEEP_SESSION,
+        HealthDataType.WORKOUT,
+      ];
+      setState(() => _status = 'Requesting WRITE permissions...');
+      final writeOk = await _health.requestAuthorization(
+        writeTypes,
+        permissions:
+            writeTypes.map((_) => HealthDataAccess.WRITE).toList(),
+      );
+      if (!mounted) return;
+      if (!writeOk) {
+        setState(() {
+          _uploading = false;
+          _status = 'WRITE permission denied. Grant in Health Connect and retry.';
+        });
+        return;
+      }
+
+      // ---- Workouts ----
+      final workouts =
+          (payload['workouts'] as List?)?.cast<Map<String, dynamic>>() ?? [];
+      int workoutsOk = 0;
+      for (var i = 0; i < workouts.length; i++) {
+        final w = workouts[i];
+        setState(() => _status =
+            'Importing workout ${i + 1}/${workouts.length}...');
+        try {
+          final ok = await _health.writeWorkoutData(
+            activityType: _parseWorkoutActivity(w['activity_type'] as String?),
+            start: DateTime.parse(w['start_time'] as String),
+            end: DateTime.parse(w['end_time'] as String),
+            totalDistance: w['total_distance_meters'] as int?,
+            totalDistanceUnit: HealthDataUnit.METER,
+            totalEnergyBurned: w['total_energy_kcal'] as int?,
+            totalEnergyBurnedUnit: HealthDataUnit.KILOCALORIE,
+            title: w['source_app'] as String?,
+          );
+          if (ok) workoutsOk++;
+        } catch (e) {
+          debugPrint('[import] workout write failed: $e');
+        }
+        if (!mounted) return;
+      }
+
+      // ---- Numeric streams we can write ----
+      const numericWritable = <String, HealthDataType>{
+        'heart_rate_samples': HealthDataType.HEART_RATE,
+      };
+      int numericOk = 0;
+      int numericTotal = 0;
+      for (final entry in numericWritable.entries) {
+        final samples = (payload[entry.key] as List?)
+                ?.cast<Map<String, dynamic>>() ??
+            [];
+        numericTotal += samples.length;
+        for (var i = 0; i < samples.length; i++) {
+          if (i % 200 == 0) {
+            setState(() => _status =
+                'Importing ${entry.key} ${i + 1}/${samples.length}...');
+            if (!mounted) return;
+          }
+          final s = samples[i];
+          try {
+            final ok = await _health.writeHealthData(
+              value: (s['value'] as num).toDouble(),
+              type: entry.value,
+              startTime: DateTime.parse(s['time'] as String),
+            );
+            if (ok) numericOk++;
+          } catch (e) {
+            debugPrint('[import] ${entry.key} write failed: $e');
+          }
+        }
+      }
+
+      // ---- Interval streams we can write ----
+      const intervalWritable = <String, HealthDataType>{
+        'step_samples': HealthDataType.STEPS,
+        'distance_samples': HealthDataType.DISTANCE_DELTA,
+        'total_calorie_samples': HealthDataType.TOTAL_CALORIES_BURNED,
+        'active_energy_samples': HealthDataType.ACTIVE_ENERGY_BURNED,
+        'sleep_sessions': HealthDataType.SLEEP_SESSION,
+      };
+      int intervalOk = 0;
+      int intervalTotal = 0;
+      for (final entry in intervalWritable.entries) {
+        final samples = (payload[entry.key] as List?)
+                ?.cast<Map<String, dynamic>>() ??
+            [];
+        intervalTotal += samples.length;
+        for (var i = 0; i < samples.length; i++) {
+          if (i % 100 == 0) {
+            setState(() => _status =
+                'Importing ${entry.key} ${i + 1}/${samples.length}...');
+            if (!mounted) return;
+          }
+          final s = samples[i];
+          try {
+            final ok = await _health.writeHealthData(
+              value: (s['value'] as num).toDouble(),
+              type: entry.value,
+              startTime: DateTime.parse(s['start'] as String),
+              endTime: DateTime.parse(s['end'] as String),
+            );
+            if (ok) intervalOk++;
+          } catch (e) {
+            debugPrint('[import] ${entry.key} write failed: $e');
+          }
+        }
+      }
+
+      // Note what got skipped so it's obvious in the result.
+      const skippedKeys = [
+        'hrv_rmssd_samples',
+        'resting_heart_rate_samples',
+        'respiratory_rate_samples',
+        'sleep_deep_samples',
+        'sleep_rem_samples',
+        'sleep_light_samples',
+        'sleep_awake_samples',
+      ];
+      int skippedCount = 0;
+      for (final k in skippedKeys) {
+        final n = (payload[k] as List?)?.length ?? 0;
+        skippedCount += n;
+        if (n > 0) {
+          debugPrint('[import] skipped $n $k (no write API)');
+        }
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _uploading = false;
+        _status = 'Import complete:\n'
+            '  workouts: $workoutsOk/${workouts.length}\n'
+            '  HR: $numericOk/$numericTotal\n'
+            '  intervals: $intervalOk/$intervalTotal\n'
+            '  skipped (no write API): $skippedCount';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _uploading = false;
+        _status = 'Import error: $e';
+      });
+    }
+  }
+
+  HealthWorkoutActivityType _parseWorkoutActivity(String? name) {
+    if (name == null) return HealthWorkoutActivityType.OTHER;
+    for (final t in HealthWorkoutActivityType.values) {
+      if (t.name == name) return t;
+    }
+    return HealthWorkoutActivityType.OTHER;
+  }
+
+  // ============================================================
+  // DEBUG ONLY — Trigger Health Connect's WRITE-permission dialog
+  // without running an import. Lets you grant writes upfront on an
+  // emulator before kicking off a multi-hour import. Permissions
+  // requested here are the same set the import will need.
+  // ============================================================
+  static const List<HealthDataType> _writeTypes = [
+    HealthDataType.HEART_RATE,
+    HealthDataType.STEPS,
+    HealthDataType.DISTANCE_DELTA,
+    HealthDataType.ACTIVE_ENERGY_BURNED,
+    HealthDataType.TOTAL_CALORIES_BURNED,
+    HealthDataType.SLEEP_SESSION,
+    HealthDataType.WORKOUT,
+  ];
+
+  Future<void> _requestWritePermissions() async {
+    setState(() => _status = 'Requesting WRITE permissions...');
+    try {
+      final ok = await _health.requestAuthorization(
+        _writeTypes,
+        permissions:
+            _writeTypes.map((_) => HealthDataAccess.WRITE).toList(),
+      );
+      if (!mounted) return;
+      setState(() {
+        _status = ok
+            ? 'WRITE permissions granted. Safe to tap Import from File.'
+            : 'WRITE permissions denied. Open Health Connect settings to grant.';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _status = 'WRITE permission error: $e';
+      });
+    }
+  }
+
   Map<String, dynamic> _numericSample(HealthDataPoint p) {
     final v = p.value;
     return {
@@ -834,6 +1194,37 @@ class _HomeScreenState extends State<HomeScreen> {
                       onPressed: _discoverAllData,
                       icon: const Icon(Icons.travel_explore),
                       label: const Text('Scan All Data (30d)'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.orange.shade800,
+                        side: BorderSide(color: Colors.orange.shade800),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      onPressed: _uploading ? null : _exportToFile,
+                      icon: const Icon(Icons.file_download),
+                      label: const Text('Export to File'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.orange.shade800,
+                        side: BorderSide(color: Colors.orange.shade800),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      onPressed:
+                          _uploading ? null : _requestWritePermissions,
+                      icon: const Icon(Icons.edit),
+                      label: const Text('Request WRITE Permissions'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.orange.shade800,
+                        side: BorderSide(color: Colors.orange.shade800),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    OutlinedButton.icon(
+                      onPressed: _uploading ? null : _importFromFile,
+                      icon: const Icon(Icons.file_upload),
+                      label: const Text('Import from File'),
                       style: OutlinedButton.styleFrom(
                         foregroundColor: Colors.orange.shade800,
                         side: BorderSide(color: Colors.orange.shade800),

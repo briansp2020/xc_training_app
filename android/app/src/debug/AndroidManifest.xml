@@ -4,4 +4,20 @@
          to allow setting breakpoints, to provide hot reload, etc.
     -->
     <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- Debug-only WRITE permissions used by the "Import from File" button to
+         replay an exported snapshot into a fresh Health Connect database
+         (typically on an emulator for testing). Lives here so production
+         builds never declare WRITE access.
+
+         Note: writing a workout via the health package internally creates a
+         TotalCaloriesBurnedRecord (not Active), so WRITE_TOTAL_CALORIES_BURNED
+         is required even if the import only writes workouts. -->
+    <uses-permission android:name="android.permission.health.WRITE_HEART_RATE"/>
+    <uses-permission android:name="android.permission.health.WRITE_STEPS"/>
+    <uses-permission android:name="android.permission.health.WRITE_DISTANCE"/>
+    <uses-permission android:name="android.permission.health.WRITE_ACTIVE_CALORIES_BURNED"/>
+    <uses-permission android:name="android.permission.health.WRITE_TOTAL_CALORIES_BURNED"/>
+    <uses-permission android:name="android.permission.health.WRITE_EXERCISE"/>
+    <uses-permission android:name="android.permission.health.WRITE_SLEEP"/>
 </manifest>

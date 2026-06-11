@@ -54,3 +54,6 @@ app.*.map.json
 
 # Claude Code
 .claude/
+
+# Personal health-data exports (Export to File debug button writes these)
+health_export*.json
