@@ -97,6 +97,10 @@ class _HomeScreenState extends State<HomeScreen> {
   String? _heartRateValue;
   String? _heartRateTime;
 
+  // Bottom-nav page index. Page 0 = Home (production UI), page 1 = Debug
+  // tools. The Debug page + its nav tab exist only in debug builds.
+  int _pageIndex = 0;
+
   // Single source of truth for what the sync reads + what we request permission
   // for. Must match the manifest's READ_* declarations and the union of
   // _numericStreams + _intervalStreams + [WORKOUT].
@@ -1244,195 +1248,205 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
+    // Page 0 = production Home. Page 1 = Debug tools (debug builds only).
+    final pages = <Widget>[
+      _buildHomePage(theme),
+      if (kDebugMode) _buildDebugPage(theme),
+    ];
+    final index = _pageIndex.clamp(0, pages.length - 1);
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('XC Training Data'),
+        title: Text(index == 0 ? 'XC Training Data' : 'Debug Tools'),
         centerTitle: true,
       ),
-      body: SingleChildScrollView(
-        padding: const EdgeInsets.all(24.0),
+      body: pages[index],
+      // Only show the nav bar when there's more than one page (i.e. debug).
+      bottomNavigationBar: pages.length < 2
+          ? null
+          : NavigationBar(
+              selectedIndex: index,
+              onDestinationSelected: (i) => setState(() => _pageIndex = i),
+              destinations: const [
+                NavigationDestination(
+                  icon: Icon(Icons.home_outlined),
+                  selectedIcon: Icon(Icons.home),
+                  label: 'Home',
+                ),
+                NavigationDestination(
+                  icon: Icon(Icons.bug_report_outlined),
+                  selectedIcon: Icon(Icons.bug_report),
+                  label: 'Debug',
+                ),
+              ],
+            ),
+    );
+  }
+
+  // Shared status card — shown on both pages so an action's result is
+  // visible whichever tab you're on.
+  Widget _buildStatusCard(ThemeData theme) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _buildAuthCard(theme),
-            const SizedBox(height: 16),
+            Text('Status', style: theme.textTheme.titleSmall),
+            const SizedBox(height: 8),
+            Text(_status),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildHomePage(ThemeData theme) {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _buildAuthCard(theme),
+          const SizedBox(height: 16),
+          _buildStatusCard(theme),
+          const SizedBox(height: 16),
+          if (!_permissionsGranted)
+            FilledButton.icon(
+              onPressed: _requestPermissions,
+              icon: const Icon(Icons.lock_open),
+              label: const Text('Request Permissions'),
+            ),
+          if (_permissionsGranted)
+            FilledButton.tonal(
+              onPressed: _uploading ? null : _readHeartRate,
+              child: const Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.favorite),
+                  SizedBox(width: 8),
+                  Text('Read My Heart Rate'),
+                ],
+              ),
+            ),
+          const SizedBox(height: 12),
+          if (_permissionsGranted)
+            FilledButton(
+              onPressed:
+                  (_uploading || !_auth.isSignedIn) ? null : _syncHealthData,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  if (_uploading)
+                    const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  else
+                    const Icon(Icons.cloud_upload),
+                  const SizedBox(width: 8),
+                  Text(_uploading
+                      ? 'Uploading...'
+                      : _auth.isSignedIn
+                          ? 'Sync to Server'
+                          : 'Sign in to sync'),
+                ],
+              ),
+            ),
+          const SizedBox(height: 24),
+          if (_heartRateValue != null)
             Card(
+              color: theme.colorScheme.primaryContainer,
               child: Padding(
-                padding: const EdgeInsets.all(16.0),
+                padding: const EdgeInsets.all(24.0),
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Status', style: theme.textTheme.titleSmall),
-                    const SizedBox(height: 8),
-                    Text(_status),
+                    Icon(
+                      Icons.favorite,
+                      size: 48,
+                      color: theme.colorScheme.primary,
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      _heartRateValue!,
+                      style: theme.textTheme.headlineMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: theme.colorScheme.onPrimaryContainer,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      _heartRateTime!,
+                      style: theme.textTheme.bodyMedium?.copyWith(
+                        color: theme.colorScheme.onPrimaryContainer,
+                      ),
+                    ),
                   ],
                 ),
               ),
             ),
-            const SizedBox(height: 16),
-            if (!_permissionsGranted)
-              FilledButton.icon(
-                onPressed: _requestPermissions,
-                icon: const Icon(Icons.lock_open),
-                label: const Text('Request Permissions'),
-              ),
-            if (_permissionsGranted)
-              FilledButton.tonal(
-                onPressed: _uploading ? null : _readHeartRate,
-                child: const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.favorite),
-                    SizedBox(width: 8),
-                    Text('Read My Heart Rate'),
-                  ],
-                ),
-              ),
-            const SizedBox(height: 12),
-            if (_permissionsGranted)
-              FilledButton(
-                onPressed: (_uploading || !_auth.isSignedIn)
-                    ? null
-                    : _syncHealthData,
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    if (_uploading)
-                      const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white,
-                        ),
-                      )
-                    else
-                      const Icon(Icons.cloud_upload),
-                    const SizedBox(width: 8),
-                    Text(_uploading
-                        ? 'Uploading...'
-                        : _auth.isSignedIn
-                            ? 'Sync to Server'
-                            : 'Sign in to sync'),
-                  ],
-                ),
-              ),
-            const SizedBox(height: 24),
-            // ============================================================
-            // DEBUG ONLY — hidden in release builds (kDebugMode = false).
-            // Remove the methods + this whole section before final ship.
-            // ============================================================
-            if (kDebugMode && _permissionsGranted)
-              Container(
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.orange, width: 2),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                padding: const EdgeInsets.all(12),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    Row(
-                      children: [
-                        Icon(Icons.bug_report, color: Colors.orange.shade800),
-                        const SizedBox(width: 6),
-                        Text(
-                          'DEBUG ONLY',
-                          style: theme.textTheme.labelMedium?.copyWith(
-                            color: Colors.orange.shade800,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    OutlinedButton.icon(
-                      onPressed: _uploading ? null : _discoverWorkoutData,
-                      icon: const Icon(Icons.search),
-                      label: const Text('Discover Workout Data'),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.orange.shade800,
-                        side: BorderSide(color: Colors.orange.shade800),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    OutlinedButton.icon(
-                      onPressed: _uploading ? null : _discoverAllData,
-                      icon: const Icon(Icons.travel_explore),
-                      label: const Text('Scan All Data (30d)'),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.orange.shade800,
-                        side: BorderSide(color: Colors.orange.shade800),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    OutlinedButton.icon(
-                      onPressed: _uploading ? null : _exportToFile,
-                      icon: const Icon(Icons.file_download),
-                      label: const Text('Export to File'),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.orange.shade800,
-                        side: BorderSide(color: Colors.orange.shade800),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    OutlinedButton.icon(
-                      onPressed:
-                          _uploading ? null : _requestWritePermissions,
-                      icon: const Icon(Icons.edit),
-                      label: const Text('Request WRITE Permissions'),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.orange.shade800,
-                        side: BorderSide(color: Colors.orange.shade800),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    OutlinedButton.icon(
-                      onPressed: _uploading ? null : _importFromFile,
-                      icon: const Icon(Icons.file_upload),
-                      label: const Text('Import from File'),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.orange.shade800,
-                        side: BorderSide(color: Colors.orange.shade800),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            const SizedBox(height: 24),
-            if (_heartRateValue != null)
-              Card(
-                color: theme.colorScheme.primaryContainer,
-                child: Padding(
-                  padding: const EdgeInsets.all(24.0),
-                  child: Column(
-                    children: [
-                      Icon(
-                        Icons.favorite,
-                        size: 48,
-                        color: theme.colorScheme.primary,
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        _heartRateValue!,
-                        style: theme.textTheme.headlineMedium?.copyWith(
-                          fontWeight: FontWeight.bold,
-                          color: theme.colorScheme.onPrimaryContainer,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        _heartRateTime!,
-                        style: theme.textTheme.bodyMedium?.copyWith(
-                          color: theme.colorScheme.onPrimaryContainer,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-          ],
+        ],
+      ),
+    );
+  }
+
+  // ============================================================
+  // DEBUG ONLY — this whole page is built only when kDebugMode is
+  // true. Remove the page (and its methods) before final ship.
+  // ============================================================
+  Widget _buildDebugPage(ThemeData theme) {
+    final orange = Colors.orange.shade800;
+    OutlinedButton debugButton(
+        IconData icon, String label, VoidCallback onPressed) {
+      return OutlinedButton.icon(
+        onPressed: _uploading ? null : onPressed,
+        icon: Icon(icon),
+        label: Text(label),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: orange,
+          side: BorderSide(color: orange),
         ),
+      );
+    }
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(24.0),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _buildStatusCard(theme),
+          const SizedBox(height: 16),
+          if (!_permissionsGranted)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Text(
+                  'Grant Health Connect permissions on the Home tab first — '
+                  'the debug tools read and write health data.',
+                  style: theme.textTheme.bodyMedium,
+                ),
+              ),
+            ),
+          if (_permissionsGranted) ...[
+            debugButton(
+                Icons.search, 'Discover Workout Data', _discoverWorkoutData),
+            const SizedBox(height: 8),
+            debugButton(
+                Icons.travel_explore, 'Scan All Data (30d)', _discoverAllData),
+            const SizedBox(height: 8),
+            debugButton(Icons.file_download, 'Export to File', _exportToFile),
+            const SizedBox(height: 8),
+            debugButton(Icons.edit, 'Request WRITE Permissions',
+                _requestWritePermissions),
+            const SizedBox(height: 8),
+            debugButton(
+                Icons.file_upload, 'Import from File', _importFromFile),
+          ],
+        ],
       ),
     );
   }
