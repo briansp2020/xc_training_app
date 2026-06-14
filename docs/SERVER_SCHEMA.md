@@ -13,15 +13,45 @@ The client is a thin uploader. It does **not** aggregate, smooth, classify, or c
 | | |
 |---|---|
 | Method | `POST` |
-| URL | Build-time `--dart-define=SERVER_URL=...` (see `config/dev.json.example`). Defaults to `http://10.0.2.2:8000/workouts` (the Android emulator's alias for the host's localhost). |
+| URL | `<base>/workouts` for the sync, `<base>/auth/google` and `<base>/auth/dev-login` for auth. `<base>` comes from `--dart-define=SERVER_URL=...` (see `config/dev.json.example`) and defaults to `http://10.0.2.2:8000` (the Android emulator's alias for the host's localhost). |
 | Content-Type | `application/json` |
 | Body encoding | UTF-8 JSON |
 | Timeout (client) | 120 seconds |
-| Auth | None for now. Add a bearer token or device token when shipping. |
+| Auth | **Required.** `Authorization: Bearer <server JWT>` — see "Auth" below. Requests without it get `401`. |
 
 The client treats any `2xx` response as success. `4xx` and `5xx` are surfaced to the user as errors with the response body included for debugging.
 
 `10.0.2.2` is the Android emulator's alias for the host machine's localhost. From a physical phone, replace with the LAN IP (or the public URL once deployed).
+
+### Auth
+
+The client signs in with Google (Google Sign-In SDK / Credential Manager on
+Android), then exchanges the **Google ID token** for the server's own JWT:
+
+```
+POST /auth/google
+{ "id_token": "<google id token>" }
+→ { "access_token": "<server jwt>", "token_type": "bearer", "athlete": {...} }
+```
+
+The Google ID token's `aud` claim must match the OAuth **web** client ID the
+server is configured with (the client passes the same value to
+`GoogleSignIn.initialize(serverClientId: ...)`). The server rejects tokens
+minted for any other audience — this is what stops an ID token from an
+unrelated app being replayed against `/auth/google`.
+
+Send `Authorization: Bearer <access_token>` on every subsequent request and
+persist the token (it currently lasts 30 days; the server will add refresh
+tokens later). On `401`, re-run the Google exchange. First sign-in creates the
+athlete server-side from the Google profile.
+
+The server derives the athlete from the token — the payload's `athlete_id`
+field is now **deprecated and ignored** (still accepted so old builds parse).
+One athlete cannot upload as another.
+
+During development the server may run with `DEV_MODE=true`, which adds
+`POST /auth/dev-login` (`{"email": "..."}` → same token response) so the app
+can be tested without a Google round-trip.
 
 ### Body size
 
@@ -78,7 +108,7 @@ Serialized JSON: **~15 MB per athlete per sync**. Plan for this in your reverse 
 | Field | Type | Notes |
 |---|---|---|
 | `type` | string literal `"health_sync"` | Discriminator. |
-| `athlete_id` | integer | Which runner this data belongs to. |
+| `athlete_id` | integer | **Deprecated — ignored.** The server attributes the upload to the athlete in the Bearer token. |
 | `client_version` | string | App version. |
 | `uploaded_at` | ISO-8601 UTC | When the client built the payload. |
 | `source_platform` | string | `"googleHealthConnect"` (Android) or `"appleHealthKit"` (iOS, future). |

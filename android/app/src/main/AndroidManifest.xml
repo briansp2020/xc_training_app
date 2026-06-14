@@ -19,7 +19,8 @@
         android:label="XC Training Data"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
-        android:usesCleartextTraffic="true"><!-- TODO: remove cleartext when server moves to HTTPS -->
+        android:usesCleartextTraffic="true"
+        android:largeHeap="true"><!-- largeHeap: a full 30-day sync moves ~165k HR samples across the method channel; TODO: remove cleartext when server moves to HTTPS -->
         <activity
             android:name=".MainActivity"
             android:exported="true"

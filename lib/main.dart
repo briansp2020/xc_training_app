@@ -8,18 +8,35 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-// Server URL. Override at run time:
+import 'auth_service.dart';
+
+// Server BASE URL (no trailing path). Override at run time:
 //   flutter run --dart-define-from-file=config/dev.json
 // (see config/dev.json.example for the schema). The default value below is
 // the Android emulator's alias for the host machine's localhost — safe as a
 // fall-back for someone freshly cloning the repo.
-const String _serverUrl = String.fromEnvironment(
+//
+// Endpoints constructed from this base:
+//   $_serverBase/workouts          — health sync (POST)
+//   $_serverBase/auth/google       — exchange Google ID token → server JWT
+//   $_serverBase/auth/dev-login    — dev-only: email-based JWT (DEV_MODE=true)
+const String _serverBase = String.fromEnvironment(
   'SERVER_URL',
-  defaultValue: 'http://10.0.2.2:8000/workouts',
+  defaultValue: 'http://10.0.2.2:8000',
 );
 
-// Identifies which runner's data this is. Hardcoded for now; eventually this
-// will come from a login flow or device-side config.
+// Google Cloud Console OAuth 2.0 **web** client ID (the audience the server
+// validates ID tokens against). Set via --dart-define-from-file=config/dev.json
+// — see CLAUDE.md "Google Sign-In setup" for the Cloud Console steps. Empty
+// disables Google Sign-In; dev-login still works.
+const String _googleServerClientId = String.fromEnvironment(
+  'GOOGLE_SERVER_CLIENT_ID',
+  defaultValue: '',
+);
+
+// Server attributes uploads to the athlete in the Bearer token; this field
+// is now deprecated and ignored, but kept in the payload so older server
+// builds still parse the request.
 const int _athleteId = 1;
 
 // Reported in every sync payload so the server can tell which client emitted
@@ -67,11 +84,16 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final Health _health = Health();
+  final AuthService _auth = AuthService(
+    serverBase: _serverBase,
+    googleServerClientId: _googleServerClientId,
+  );
 
   String _status = 'Initializing Health Connect...';
   bool _configured = false;
   bool _permissionsGranted = false;
   bool _uploading = false;
+  bool _authLoading = true;
   String? _heartRateValue;
   String? _heartRateTime;
 
@@ -112,7 +134,164 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-    _configureHealth();
+    _bootstrap();
+  }
+
+  Future<void> _bootstrap() async {
+    await _auth.load();
+    if (!mounted) return;
+    setState(() {
+      _authLoading = false;
+    });
+    await _configureHealth();
+  }
+
+  Future<void> _signInWithGoogle() async {
+    setState(() => _status = 'Signing in with Google...');
+    final err = await _auth.signInWithGoogle();
+    if (!mounted) return;
+    setState(() {
+      _status = err ?? 'Signed in as ${_auth.email ?? _auth.name ?? "(unknown)"}.';
+    });
+  }
+
+  Future<void> _signInWithDevEmail() async {
+    final controller = TextEditingController(text: _auth.email ?? '');
+    final email = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Dev sign-in'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('Email to sign in as. The server must be running '
+                'with DEV_MODE=true for this to work.'),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              keyboardType: TextInputType.emailAddress,
+              decoration: const InputDecoration(
+                labelText: 'Email',
+                hintText: 'you@example.com',
+              ),
+              autofocus: true,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(controller.text),
+            child: const Text('Sign in'),
+          ),
+        ],
+      ),
+    );
+    if (email == null || email.trim().isEmpty) return;
+    if (!mounted) return;
+    setState(() => _status = 'Signing in as $email...');
+    final err = await _auth.signInWithDevEmail(email);
+    if (!mounted) return;
+    setState(() {
+      _status = err ?? 'Signed in as ${_auth.email ?? email}.';
+    });
+  }
+
+  Future<void> _signOut() async {
+    await _auth.signOut();
+    if (!mounted) return;
+    setState(() => _status = 'Signed out.');
+  }
+
+  Widget _buildAuthCard(ThemeData theme) {
+    // Hide the auth UI entirely until prefs are loaded — avoids the brief
+    // "not signed in" flash on a returning user.
+    if (_authLoading) {
+      return const Card(
+        child: Padding(
+          padding: EdgeInsets.all(16.0),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 16,
+                height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              ),
+              SizedBox(width: 12),
+              Text('Loading saved session...'),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (_auth.isSignedIn) {
+      final label = _auth.email ?? _auth.name ?? 'Signed in';
+      return Card(
+        color: theme.colorScheme.secondaryContainer,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
+          child: Row(
+            children: [
+              Icon(Icons.account_circle,
+                  color: theme.colorScheme.onSecondaryContainer),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    color: theme.colorScheme.onSecondaryContainer,
+                    fontWeight: FontWeight.w500,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              TextButton(
+                onPressed: _signOut,
+                child: const Text('Sign out'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text('Sign in to sync', style: theme.textTheme.titleSmall),
+            const SizedBox(height: 4),
+            Text(
+              'Your athlete identity is read from the bearer token the '
+              'server issues — pick a sign-in method.',
+              style: theme.textTheme.bodySmall,
+            ),
+            const SizedBox(height: 12),
+            FilledButton.icon(
+              onPressed:
+                  _auth.isGoogleConfigured ? _signInWithGoogle : null,
+              icon: const Icon(Icons.login),
+              label: Text(_auth.isGoogleConfigured
+                  ? 'Sign in with Google'
+                  : 'Google Sign-In not configured'),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: _signInWithDevEmail,
+              icon: const Icon(Icons.developer_mode),
+              label: const Text('Dev sign-in (server DEV_MODE only)'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _configureHealth() async {
@@ -195,7 +374,10 @@ class _HomeScreenState extends State<HomeScreen> {
   // `flutter run` terminal.
   // ============================================================
   Future<void> _discoverWorkoutData() async {
-    setState(() => _status = 'Discovering — watch the console output...');
+    setState(() {
+      _uploading = true;
+      _status = 'Discovering — watch the console output...';
+    });
 
     const indent = JsonEncoder.withIndent('  ');
 
@@ -243,7 +425,10 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       if (workouts.isEmpty) {
         debugPrint('[DISCOVERY] No workouts found in last 90 days.');
-        setState(() => _status = 'No workouts found. See console.');
+        setState(() {
+          _uploading = false;
+          _status = 'No workouts found. See console.';
+        });
         return;
       }
 
@@ -306,11 +491,17 @@ class _HomeScreenState extends State<HomeScreen> {
       debugPrint('$bar\n');
 
       if (!mounted) return;
-      setState(() => _status =
-          'Discovery complete: ${recent.length} workout(s) dumped. Check console.');
+      setState(() {
+        _uploading = false;
+        _status =
+            'Discovery complete: ${recent.length} workout(s) dumped. Check console.';
+      });
     } catch (e) {
       if (!mounted) return;
-      setState(() => _status = 'Discovery error: $e');
+      setState(() {
+        _uploading = false;
+        _status = 'Discovery error: $e';
+      });
     }
   }
 
@@ -331,8 +522,10 @@ class _HomeScreenState extends State<HomeScreen> {
   // ISN'T classifying as workouts is still present as raw data.
   // ============================================================
   Future<void> _discoverAllData() async {
-    setState(() => _status =
-        'Scanning 30 days of all data types — watch console...');
+    setState(() {
+      _uploading = true;
+      _status = 'Scanning 30 days of all data types — watch console...';
+    });
 
     const indent = JsonEncoder.withIndent('  ');
     final bar = '=' * 70;
@@ -459,11 +652,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
       if (!mounted) return;
       final nonEmpty = results.entries.where((e) => e.value.isNotEmpty).length;
-      setState(() => _status =
-          'Scan complete: $nonEmpty/${allTypes.length} types had data. Check console.');
+      setState(() {
+        _uploading = false;
+        _status =
+            'Scan complete: $nonEmpty/${allTypes.length} types had data. Check console.';
+      });
     } catch (e) {
       if (!mounted) return;
-      setState(() => _status = 'Scan error: $e');
+      setState(() {
+        _uploading = false;
+        _status = 'Scan error: $e';
+      });
     }
   }
 
@@ -473,7 +672,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // into an emulator for testing the server's session-detection
   // algorithm against real data without re-syncing the phone.
   //
-  // Output: /storage/emulated/0/Android/data/com.example.xctraining/files/health_export.json
+  // Output: /storage/emulated/0/Android/data/com.github.briansp2020.xctraining/files/health_export.json
   // ============================================================
   Future<void> _exportToFile() async {
     setState(() {
@@ -485,74 +684,11 @@ class _HomeScreenState extends State<HomeScreen> {
       final now = DateTime.now();
       final windowStart = now.subtract(_firstSyncWindow);
 
-      final workouts =
-          await _safeRead(HealthDataType.WORKOUT, windowStart, now);
+      final built =
+          await _buildSyncPayload(windowStart, now, labelSuffix: ' (export)');
       if (!mounted) return;
-
-      final workoutPayloads = workouts.map((w) {
-        final wv = w.value is WorkoutHealthValue
-            ? w.value as WorkoutHealthValue
-            : null;
-        return <String, dynamic>{
-          'source_uuid': w.uuid,
-          'source_app': w.sourceName,
-          'source_device_id': w.sourceDeviceId,
-          'activity_type': wv?.workoutActivityType.name ?? 'OTHER',
-          'recording_method': w.recordingMethod.name,
-          'start_time': w.dateFrom.toUtc().toIso8601String(),
-          'end_time': w.dateTo.toUtc().toIso8601String(),
-          'duration_seconds': w.dateTo.difference(w.dateFrom).inSeconds,
-          'total_distance_meters': wv?.totalDistance,
-          'total_energy_kcal': wv?.totalEnergyBurned,
-          'total_steps': wv?.totalSteps,
-        };
-      }).toList();
-
-      final allStreamTypes = <HealthDataType>{
-        ..._numericStreams.values,
-        ..._intervalStreams.values,
-      }.toList();
-      setState(() => _status = 'Reading all streams (export)...');
-      List<HealthDataPoint> allSamples;
-      try {
-        allSamples = await _health.getHealthDataFromTypes(
-          types: allStreamTypes,
-          startTime: windowStart,
-          endTime: now,
-        );
-      } catch (e, st) {
-        debugPrint('[export] batch read failed: $e\n$st');
-        allSamples = [];
-      }
-      if (!mounted) return;
-
-      final byType = <HealthDataType, List<HealthDataPoint>>{};
-      for (final s in allSamples) {
-        byType.putIfAbsent(s.type, () => []).add(s);
-      }
-
-      final payload = <String, dynamic>{
-        'type': 'health_sync',
-        'athlete_id': _athleteId,
-        'client_version': _clientVersion,
-        'uploaded_at': now.toUtc().toIso8601String(),
-        'source_platform': 'googleHealthConnect',
-        'window_start': windowStart.toUtc().toIso8601String(),
-        'window_end': now.toUtc().toIso8601String(),
-        'workouts': workoutPayloads,
-      };
-
-      int totalSamples = 0;
-      for (final e in _numericStreams.entries) {
-        final samples = byType[e.value] ?? const [];
-        payload[e.key] = samples.map(_numericSample).toList();
-        totalSamples += samples.length;
-      }
-      for (final e in _intervalStreams.entries) {
-        final samples = byType[e.value] ?? const [];
-        payload[e.key] = samples.map(_intervalSample).toList();
-        totalSamples += samples.length;
-      }
+      final payload = built.payload;
+      final workoutCount = (payload['workouts'] as List).length;
 
       final dir = await getExternalStorageDirectory();
       if (!mounted) return;
@@ -568,7 +704,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _uploading = false;
         _status = 'Exported $sizeMB MB '
-            '(${workouts.length} workouts, $totalSamples samples) to:\n'
+            '($workoutCount workouts, ${built.totalSamples} samples) to:\n'
             '${file.path}';
       });
     } catch (e) {
@@ -892,6 +1028,89 @@ class _HomeScreenState extends State<HomeScreen> {
     'sleep_awake_samples': HealthDataType.SLEEP_AWAKE,
   };
 
+  /// Reads workouts + every configured stream over [windowStart, now] and
+  /// assembles the `health_sync` payload. Shared by sync and export so the
+  /// two can't drift (a past divergence here caused an OOM). Updates `_status`
+  /// per stream; [labelSuffix] distinguishes the caller in that text.
+  ///
+  /// Reads one stream per query on purpose — batching all types into a single
+  /// getHealthDataFromTypes call makes the health plugin serialize the whole
+  /// result across the method channel in one allocation, and a full window of
+  /// ~165k HR samples OOMs the Java heap.
+  Future<({Map<String, dynamic> payload, int totalSamples, DateTime? maxSampleTime})>
+      _buildSyncPayload(DateTime windowStart, DateTime now,
+          {String labelSuffix = ''}) async {
+    // Newest dateTo across everything we read — becomes the sync watermark.
+    DateTime? maxSampleTime;
+    void trackMax(DateTime t) {
+      if (maxSampleTime == null || t.isAfter(maxSampleTime!)) {
+        maxSampleTime = t;
+      }
+    }
+
+    // Workouts use the package's special WORKOUT path (it aggregates
+    // distance/calories/steps from related records). Separate read.
+    final workouts = await _safeRead(HealthDataType.WORKOUT, windowStart, now);
+    for (final w in workouts) {
+      trackMax(w.dateTo);
+    }
+
+    final workoutPayloads = workouts.map((w) {
+      final wv =
+          w.value is WorkoutHealthValue ? w.value as WorkoutHealthValue : null;
+      return <String, dynamic>{
+        'source_uuid': w.uuid,
+        'source_app': w.sourceName,
+        'source_device_id': w.sourceDeviceId,
+        'activity_type': wv?.workoutActivityType.name ?? 'OTHER',
+        'recording_method': w.recordingMethod.name,
+        'start_time': w.dateFrom.toUtc().toIso8601String(),
+        'end_time': w.dateTo.toUtc().toIso8601String(),
+        'duration_seconds': w.dateTo.difference(w.dateFrom).inSeconds,
+        'total_distance_meters': wv?.totalDistance,
+        'total_energy_kcal': wv?.totalEnergyBurned,
+        'total_steps': wv?.totalSteps,
+      };
+    }).toList();
+
+    final payload = <String, dynamic>{
+      'type': 'health_sync',
+      'athlete_id': _athleteId,
+      'client_version': _clientVersion,
+      'uploaded_at': now.toUtc().toIso8601String(),
+      'source_platform': 'googleHealthConnect',
+      'window_start': windowStart.toUtc().toIso8601String(),
+      'window_end': now.toUtc().toIso8601String(),
+      'workouts': workoutPayloads,
+    };
+
+    var totalSamples = 0;
+    for (final e in _numericStreams.entries) {
+      if (mounted) setState(() => _status = 'Reading ${e.key}$labelSuffix...');
+      final samples = await _safeRead(e.value, windowStart, now);
+      for (final s in samples) {
+        trackMax(s.dateTo);
+      }
+      payload[e.key] = samples.map(_numericSample).toList();
+      totalSamples += samples.length;
+    }
+    for (final e in _intervalStreams.entries) {
+      if (mounted) setState(() => _status = 'Reading ${e.key}$labelSuffix...');
+      final samples = await _safeRead(e.value, windowStart, now);
+      for (final s in samples) {
+        trackMax(s.dateTo);
+      }
+      payload[e.key] = samples.map(_intervalSample).toList();
+      totalSamples += samples.length;
+    }
+
+    return (
+      payload: payload,
+      totalSamples: totalSamples,
+      maxSampleTime: maxSampleTime,
+    );
+  }
+
   Future<void> _syncHealthData() async {
     setState(() {
       _uploading = true;
@@ -911,106 +1130,25 @@ class _HomeScreenState extends State<HomeScreen> {
           ? 'since last sync (${windowDays.toStringAsFixed(1)} days)'
           : 'full ${_firstSyncWindow.inDays}-day window (first sync)';
 
-      // Track the newest dateTo we see across every record we upload, and
-      // use that (not `now`) as the next watermark — so the next sync picks
-      // up exactly where the data left off, even if Health Connect has gaps
-      // or hasn't indexed very-recent samples yet.
-      DateTime? maxSampleTime;
-      void trackMax(DateTime t) {
-        if (maxSampleTime == null || t.isAfter(maxSampleTime!)) {
-          maxSampleTime = t;
-        }
-      }
-
-      // Workouts go through the package's special WORKOUT path (it
-      // aggregates distance/calories/steps from related records). Keep
-      // it as a separate read.
-      final workouts =
-          await _safeRead(HealthDataType.WORKOUT, windowStart, now);
+      final built = await _buildSyncPayload(windowStart, now);
       if (!mounted) return;
-      for (final w in workouts) {
-        trackMax(w.dateTo);
-      }
-
-      final workoutPayloads = workouts.map((w) {
-        final wv = w.value is WorkoutHealthValue
-            ? w.value as WorkoutHealthValue
-            : null;
-        return <String, dynamic>{
-          'source_uuid': w.uuid,
-          'source_app': w.sourceName,
-          'source_device_id': w.sourceDeviceId,
-          'activity_type': wv?.workoutActivityType.name ?? 'OTHER',
-          'recording_method': w.recordingMethod.name,
-          'start_time': w.dateFrom.toUtc().toIso8601String(),
-          'end_time': w.dateTo.toUtc().toIso8601String(),
-          'duration_seconds': w.dateTo.difference(w.dateFrom).inSeconds,
-          'total_distance_meters': wv?.totalDistance,
-          'total_energy_kcal': wv?.totalEnergyBurned,
-          'total_steps': wv?.totalSteps,
-        };
-      }).toList();
-
-      // Batch every non-workout stream into a single Health Connect query.
-      // Far fewer Kotlin round-trips than reading each type individually.
-      final allStreamTypes = <HealthDataType>{
-        ..._numericStreams.values,
-        ..._intervalStreams.values,
-      }.toList();
-      setState(
-          () => _status = 'Reading ${allStreamTypes.length} streams in one batch...');
-      List<HealthDataPoint> allSamples;
-      try {
-        allSamples = await _health.getHealthDataFromTypes(
-          types: allStreamTypes,
-          startTime: windowStart,
-          endTime: now,
-        );
-      } catch (e, st) {
-        debugPrint('[sync] batch read failed: $e\n$st');
-        allSamples = [];
-      }
-      if (!mounted) return;
-
-      // Bucket by type so we can populate the per-stream payload arrays.
-      final byType = <HealthDataType, List<HealthDataPoint>>{};
-      for (final s in allSamples) {
-        byType.putIfAbsent(s.type, () => []).add(s);
-        trackMax(s.dateTo);
-      }
-
-      final payload = <String, dynamic>{
-        'type': 'health_sync',
-        'athlete_id': _athleteId,
-        'client_version': _clientVersion,
-        'uploaded_at': now.toUtc().toIso8601String(),
-        'source_platform': 'googleHealthConnect',
-        'window_start': windowStart.toUtc().toIso8601String(),
-        'window_end': now.toUtc().toIso8601String(),
-        'workouts': workoutPayloads,
-      };
-
-      int totalSamples = 0;
-      for (final e in _numericStreams.entries) {
-        final samples = byType[e.value] ?? const [];
-        payload[e.key] = samples.map(_numericSample).toList();
-        totalSamples += samples.length;
-      }
-      for (final e in _intervalStreams.entries) {
-        final samples = byType[e.value] ?? const [];
-        payload[e.key] = samples.map(_intervalSample).toList();
-        totalSamples += samples.length;
-      }
+      final payload = built.payload;
+      final totalSamples = built.totalSamples;
+      final maxSampleTime = built.maxSampleTime;
+      final workoutCount = (payload['workouts'] as List).length;
 
       final bodyBytes = utf8.encode(jsonEncode(payload));
       final sizeMB = (bodyBytes.length / 1024 / 1024).toStringAsFixed(2);
       setState(() => _status =
-          'Uploading ${workouts.length} workouts + $totalSamples samples ($sizeMB MB)...');
+          'Uploading $workoutCount workouts + $totalSamples samples ($sizeMB MB)...');
 
       final response = await http
           .post(
-            Uri.parse(_serverUrl),
-            headers: {'Content-Type': 'application/json'},
+            Uri.parse('$_serverBase/workouts'),
+            headers: {
+              'Content-Type': 'application/json',
+              ..._auth.authHeaders,
+            },
             body: bodyBytes,
           )
           .timeout(const Duration(seconds: 120));
@@ -1023,15 +1161,28 @@ class _HomeScreenState extends State<HomeScreen> {
         // watermark alone so the next sync re-queries the same window —
         // that way delayed Health Connect inserts can still be picked up.
         await prefs.setString(
-            _lastSyncPrefsKey, maxSampleTime!.toUtc().toIso8601String());
+            _lastSyncPrefsKey, maxSampleTime.toUtc().toIso8601String());
         if (!mounted) return;
+      }
+
+      // 401 → token rejected. Drop it so the next sync attempt forces
+      // sign-in, and show the auth card again instead of a noisy error.
+      if (response.statusCode == 401) {
+        await _auth.invalidate();
+        if (!mounted) return;
+        setState(() {
+          _uploading = false;
+          _status =
+              'Sign-in expired. Please sign in again, then re-tap Sync.';
+        });
+        return;
       }
 
       setState(() {
         _uploading = false;
         if (ok) {
           _status =
-              'Synced $sizeMB MB ($windowLabel): ${workouts.length} workouts, $totalSamples samples. Server: ${response.statusCode}.';
+              'Synced $sizeMB MB ($windowLabel): $workoutCount workouts, $totalSamples samples. Server: ${response.statusCode}.';
         } else {
           _status = 'Upload failed: ${response.statusCode}\n${response.body}';
         }
@@ -1070,9 +1221,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
       data.sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
       final latest = data.first;
+      final v = latest.value;
+      final bpm = v is NumericHealthValue ? v.numericValue : v;
 
       setState(() {
-        _heartRateValue = '${latest.value} BPM';
+        _heartRateValue = '$bpm BPM';
         _heartRateTime = latest.dateFrom.toLocal().toString().substring(0, 19);
         _status =
             'Heart rate data loaded (${data.length} readings in last 24h).';
@@ -1096,11 +1249,13 @@ class _HomeScreenState extends State<HomeScreen> {
         title: const Text('XC Training Data'),
         centerTitle: true,
       ),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(24.0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            _buildAuthCard(theme),
+            const SizedBox(height: 16),
             Card(
               child: Padding(
                 padding: const EdgeInsets.all(16.0),
@@ -1123,7 +1278,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             if (_permissionsGranted)
               FilledButton.tonal(
-                onPressed: _readHeartRate,
+                onPressed: _uploading ? null : _readHeartRate,
                 child: const Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
@@ -1136,7 +1291,9 @@ class _HomeScreenState extends State<HomeScreen> {
             const SizedBox(height: 12),
             if (_permissionsGranted)
               FilledButton(
-                onPressed: _uploading ? null : _syncHealthData,
+                onPressed: (_uploading || !_auth.isSignedIn)
+                    ? null
+                    : _syncHealthData,
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
@@ -1152,7 +1309,11 @@ class _HomeScreenState extends State<HomeScreen> {
                     else
                       const Icon(Icons.cloud_upload),
                     const SizedBox(width: 8),
-                    Text(_uploading ? 'Uploading...' : 'Sync to Server'),
+                    Text(_uploading
+                        ? 'Uploading...'
+                        : _auth.isSignedIn
+                            ? 'Sync to Server'
+                            : 'Sign in to sync'),
                   ],
                 ),
               ),
@@ -1186,7 +1347,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                     const SizedBox(height: 8),
                     OutlinedButton.icon(
-                      onPressed: _discoverWorkoutData,
+                      onPressed: _uploading ? null : _discoverWorkoutData,
                       icon: const Icon(Icons.search),
                       label: const Text('Discover Workout Data'),
                       style: OutlinedButton.styleFrom(
@@ -1196,7 +1357,7 @@ class _HomeScreenState extends State<HomeScreen> {
                     ),
                     const SizedBox(height: 8),
                     OutlinedButton.icon(
-                      onPressed: _discoverAllData,
+                      onPressed: _uploading ? null : _discoverAllData,
                       icon: const Icon(Icons.travel_explore),
                       label: const Text('Scan All Data (30d)'),
                       style: OutlinedButton.styleFrom(
