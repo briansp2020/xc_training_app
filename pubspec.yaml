@@ -39,6 +39,7 @@ dependencies:
   shared_preferences: ^2.5.5
   path_provider: ^2.1.5
   google_sign_in: ^7.2.0
+  geolocator: ^13.0.1 # DIY GPS route recording (foreground for now)
 
 dev_dependencies:
   flutter_test:

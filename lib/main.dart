@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:health/health.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
@@ -55,6 +57,35 @@ const Duration _firstSyncWindow = Duration(days: 30);
 // upsert dedup makes the duplicates harmless.
 const Duration _watermarkOverlap = Duration(hours: 1);
 
+// One GPS fix in a recorded route. Serialized to the local track JSON; this
+// shape is what a future server route-upload endpoint will consume.
+class _TrackPoint {
+  final double lat;
+  final double lng;
+  final DateTime time;
+  final double accuracy; // meters
+  final double altitude; // meters
+  final double speed; // m/s
+
+  _TrackPoint({
+    required this.lat,
+    required this.lng,
+    required this.time,
+    required this.accuracy,
+    required this.altitude,
+    required this.speed,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'lat': lat,
+        'lng': lng,
+        'time': time.toUtc().toIso8601String(),
+        'accuracy_m': accuracy,
+        'altitude_m': altitude,
+        'speed_mps': speed,
+      };
+}
+
 void main() {
   runApp(const XCTrainingApp());
 }
@@ -96,6 +127,16 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _authLoading = true;
   String? _heartRateValue;
   String? _heartRateTime;
+
+  // DIY GPS route recording (foreground only for now). _track accumulates fixes
+  // while _recording; _distanceMeters is summed incrementally between fixes.
+  bool _recording = false;
+  final List<_TrackPoint> _track = [];
+  double _distanceMeters = 0;
+  DateTime? _recordStart;
+  Duration _elapsed = Duration.zero;
+  StreamSubscription<Position>? _posSub;
+  Timer? _tick;
 
   // Bottom-nav page index. Page 0 = Home (production UI), page 1 = Debug
   // tools. The Debug page + its nav tab exist only in debug builds.
@@ -148,6 +189,138 @@ class _HomeScreenState extends State<HomeScreen> {
       _authLoading = false;
     });
     await _configureHealth();
+  }
+
+  @override
+  void dispose() {
+    _posSub?.cancel();
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  // ---- DIY GPS route recording (Milestone A: foreground + local save) ----
+
+  // Ensures GPS is on and we hold at least while-in-use location permission.
+  // Background ("Allow all the time") is a later milestone.
+  Future<bool> _ensureLocationPermission() async {
+    if (!await Geolocator.isLocationServiceEnabled()) {
+      setState(() => _status = 'Location is off — enable GPS, then start the run.');
+      return false;
+    }
+    var perm = await Geolocator.checkPermission();
+    if (perm == LocationPermission.denied) {
+      perm = await Geolocator.requestPermission();
+    }
+    if (perm == LocationPermission.denied ||
+        perm == LocationPermission.deniedForever) {
+      setState(() => _status =
+          'Location permission denied. Grant it in Settings to record runs.');
+      return false;
+    }
+    return true;
+  }
+
+  Future<void> _startRecording() async {
+    if (!await _ensureLocationPermission()) return;
+    if (!mounted) return;
+    setState(() {
+      _recording = true;
+      _track.clear();
+      _distanceMeters = 0;
+      _elapsed = Duration.zero;
+      _recordStart = DateTime.now();
+      _status = 'Recording run — keep the app open (background comes later).';
+    });
+
+    const settings = LocationSettings(
+      accuracy: LocationAccuracy.high,
+      distanceFilter: 5, // meters between fixes — filters GPS jitter at rest
+    );
+    _posSub = Geolocator.getPositionStream(locationSettings: settings).listen(
+      (pos) {
+        if (!mounted) return;
+        setState(() {
+          if (_track.isNotEmpty) {
+            final last = _track.last;
+            _distanceMeters += Geolocator.distanceBetween(
+                last.lat, last.lng, pos.latitude, pos.longitude);
+          }
+          _track.add(_TrackPoint(
+            lat: pos.latitude,
+            lng: pos.longitude,
+            time: pos.timestamp,
+            accuracy: pos.accuracy,
+            altitude: pos.altitude,
+            speed: pos.speed,
+          ));
+        });
+      },
+      onError: (e) {
+        if (!mounted) return;
+        setState(() => _status = 'GPS error: $e');
+      },
+    );
+
+    _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted || _recordStart == null) return;
+      setState(() => _elapsed = DateTime.now().difference(_recordStart!));
+    });
+  }
+
+  Future<void> _stopRecording() async {
+    final end = DateTime.now();
+    await _posSub?.cancel();
+    _posSub = null;
+    _tick?.cancel();
+    _tick = null;
+    final points = _track.toList();
+    if (!mounted) return;
+    setState(() => _recording = false);
+
+    if (points.isEmpty) {
+      setState(() => _status = 'Stopped — no GPS fixes captured.');
+      return;
+    }
+
+    // end_time is the stop moment (not the last GPS fix) so it stays
+    // consistent with duration — the tail of a run can be still, producing
+    // no new fixes, which would otherwise make end_time lag the real stop.
+    final start = _recordStart ?? points.first.time;
+    final duration = end.difference(start);
+    final payload = {
+      'type': 'route_track',
+      'source': 'diy_gps',
+      'recorded_at': end.toUtc().toIso8601String(),
+      'start_time': start.toUtc().toIso8601String(),
+      'end_time': end.toUtc().toIso8601String(),
+      'duration_seconds': duration.inSeconds,
+      'distance_meters': _distanceMeters,
+      'point_count': points.length,
+      'points': [for (final p in points) p.toJson()],
+    };
+
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final stamp =
+          start.toUtc().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
+      final file = File('${dir.path}/xc_route_$stamp.json');
+      await file.writeAsString(jsonEncode(payload));
+      if (!mounted) return;
+      setState(() {
+        _status = 'Saved run: ${(_distanceMeters / 1000).toStringAsFixed(2)} km, '
+            '${_fmtDuration(duration)}, ${points.length} points\n→ ${file.path}';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _status = 'Failed to save run: $e');
+    }
+  }
+
+  String _fmtDuration(Duration d) {
+    final h = d.inHours;
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 
   Future<void> _signInWithGoogle() async {
@@ -1301,6 +1474,68 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  // GPS route recording card — independent of Health Connect permissions.
+  Widget _buildRecordCard(ThemeData theme) {
+    final km = (_distanceMeters / 1000).toStringAsFixed(2);
+    return Card(
+      color: _recording ? theme.colorScheme.tertiaryContainer : null,
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.route),
+                const SizedBox(width: 8),
+                Text('Record Run (GPS)', style: theme.textTheme.titleSmall),
+              ],
+            ),
+            if (_recording) ...[
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  _recordStat(theme, _fmtDuration(_elapsed), 'time'),
+                  _recordStat(theme, km, 'km'),
+                  _recordStat(theme, '${_track.length}', 'points'),
+                ],
+              ),
+            ],
+            const SizedBox(height: 16),
+            if (!_recording)
+              FilledButton.icon(
+                onPressed: _startRecording,
+                icon: const Icon(Icons.play_arrow),
+                label: const Text('Start Run'),
+              )
+            else
+              FilledButton.icon(
+                onPressed: _stopRecording,
+                style: FilledButton.styleFrom(
+                  backgroundColor: theme.colorScheme.error,
+                  foregroundColor: theme.colorScheme.onError,
+                ),
+                icon: const Icon(Icons.stop),
+                label: const Text('Stop & Save'),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _recordStat(ThemeData theme, String value, String label) {
+    return Column(
+      children: [
+        Text(value,
+            style: theme.textTheme.titleLarge
+                ?.copyWith(fontWeight: FontWeight.bold)),
+        Text(label, style: theme.textTheme.bodySmall),
+      ],
+    );
+  }
+
   Widget _buildHomePage(ThemeData theme) {
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24.0),
@@ -1310,6 +1545,8 @@ class _HomeScreenState extends State<HomeScreen> {
           _buildAuthCard(theme),
           const SizedBox(height: 16),
           _buildStatusCard(theme),
+          const SizedBox(height: 16),
+          _buildRecordCard(theme),
           const SizedBox(height: 16),
           if (!_permissionsGranted)
             FilledButton.icon(
