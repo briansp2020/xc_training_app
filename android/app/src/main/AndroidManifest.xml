@@ -15,11 +15,19 @@
     <uses-permission android:name="android.permission.health.READ_RESTING_HEART_RATE"/>
     <uses-permission android:name="android.permission.health.READ_RESPIRATORY_RATE"/>
 
-    <!-- GPS route recording (foreground only for now). Background recording with
-         the screen off will additionally need ACCESS_BACKGROUND_LOCATION +
-         FOREGROUND_SERVICE_LOCATION — added in the next milestone. -->
+    <!-- GPS route recording. geolocator_android declares a location-typed
+         foreground service; with it running, Android keeps location flowing
+         while the screen is off, so "while using the app" permission is enough.
+         We deliberately do NOT request ACCESS_BACKGROUND_LOCATION — the
+         foreground service covers our use and it avoids the Play Store
+         background-location review. -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+    <!-- Required by geolocator's enableWakeLock — keeps the CPU awake for GPS
+         while the screen is off during a recording. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
 
     <application
         android:label="XC Training Data"

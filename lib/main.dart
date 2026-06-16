@@ -229,12 +229,24 @@ class _HomeScreenState extends State<HomeScreen> {
       _distanceMeters = 0;
       _elapsed = Duration.zero;
       _recordStart = DateTime.now();
-      _status = 'Recording run — keep the app open (background comes later).';
+      _status = 'Recording run — you can lock the screen; '
+          'a notification keeps it tracking.';
     });
 
-    const settings = LocationSettings(
+    // AndroidSettings (vs plain LocationSettings) lets geolocator promote its
+    // location service to a foreground service via foregroundNotificationConfig,
+    // which is what keeps GPS flowing with the screen off / app backgrounded.
+    // iOS would need AppleSettings here when iOS support is added.
+    final settings = AndroidSettings(
       accuracy: LocationAccuracy.high,
       distanceFilter: 5, // meters between fixes — filters GPS jitter at rest
+      foregroundNotificationConfig: const ForegroundNotificationConfig(
+        notificationTitle: 'XC Training — recording run',
+        notificationText: 'Tracking your GPS route',
+        notificationChannelName: 'Run recording',
+        enableWakeLock: true, // keep the CPU awake for GPS while screen is off
+        setOngoing: true, // can't be swiped away mid-run
+      ),
     );
     _posSub = Geolocator.getPositionStream(locationSettings: settings).listen(
       (pos) {
