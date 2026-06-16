@@ -1912,6 +1912,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   '${_fmtDuration(r.duration)} · ${r.pointCount} pts'),
               trailing: const Icon(Icons.chevron_right),
               onTap: () => _openRun(r),
+              onLongPress: () => _confirmDeleteRun(r),
             );
           },
         );
@@ -1940,6 +1941,46 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     runs.sort((a, b) => b.start.compareTo(a.start)); // newest first
     return runs;
+  }
+
+  Future<void> _confirmDeleteRun(_RunSummary r) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete this run?'),
+        content: Text(
+          '${_fmtRunDate(r.start)}\n'
+          '${r.km.toStringAsFixed(2)} km · ${_fmtDuration(r.duration)} · '
+          '${r.pointCount} points\n\nThis permanently deletes the saved track.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+              foregroundColor: Theme.of(ctx).colorScheme.onError,
+            ),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    try {
+      await r.file.delete();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _status = 'Could not delete run: $e');
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _runsFuture = _loadRuns(); // refresh the list
+    });
   }
 
   Future<void> _openRun(_RunSummary r) async {
