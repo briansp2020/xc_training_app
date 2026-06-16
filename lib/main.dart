@@ -1728,11 +1728,11 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildRecordPage(ThemeData theme) {
     final trackPts = [for (final p in _track) LatLng(p.lat, p.lng)];
     final km = (_distanceMeters / 1000).toStringAsFixed(2);
-    // Show a compass (needle to north) when centered but rotated; otherwise the
-    // crosshair for "recenter on me".
-    final norm = ((_mapRotation % 360) + 360) % 360;
-    final aligned = norm < 0.5 || norm > 359.5;
-    final showCompass = _mapCentered && !aligned;
+    // Show the compass whenever the map is centered on the user — the needle
+    // points straight up/down when aligned to north, and rotates to true north
+    // when the map is turned. The crosshair "recenter" icon shows only when the
+    // map has been panned off the current location.
+    final showCompass = _mapCentered;
 
     return Stack(
       children: [
