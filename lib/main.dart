@@ -4,7 +4,9 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:latlong2/latlong.dart';
 import 'package:health/health.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
@@ -86,6 +88,108 @@ class _TrackPoint {
       };
 }
 
+// Summary of a saved run, parsed from a track JSON file for the Runs list.
+class _RunSummary {
+  final File file;
+  final DateTime start;
+  final double km;
+  final Duration duration;
+  final int pointCount;
+
+  _RunSummary({
+    required this.file,
+    required this.start,
+    required this.km,
+    required this.duration,
+    required this.pointCount,
+  });
+}
+
+// Read-only map view of one saved run: its path, with start/end markers,
+// framed to fit the whole route.
+class _RunMapPage extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final List<LatLng> points;
+
+  const _RunMapPage({
+    required this.title,
+    required this.subtitle,
+    required this.points,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(title),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(24),
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Text(subtitle, style: theme.textTheme.bodySmall),
+          ),
+        ),
+      ),
+      body: points.isEmpty
+          ? const Center(child: Text('No points in this run.'))
+          : FlutterMap(
+              options: MapOptions(
+                initialCenter: points.first,
+                initialZoom: 16,
+                initialCameraFit: points.length >= 2
+                    ? CameraFit.coordinates(
+                        coordinates: points,
+                        padding: const EdgeInsets.all(40),
+                      )
+                    : null,
+              ),
+              children: [
+                TileLayer(
+                  urlTemplate:
+                      'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                  userAgentPackageName: 'com.github.briansp2020.xctraining',
+                ),
+                PolylineLayer(
+                  polylines: [
+                    Polyline(
+                      points: points,
+                      strokeWidth: 5,
+                      color: theme.colorScheme.primary,
+                    ),
+                  ],
+                ),
+                MarkerLayer(
+                  markers: [
+                    Marker(
+                      point: points.first,
+                      width: 16,
+                      height: 16,
+                      child: _dot(Colors.green),
+                    ),
+                    Marker(
+                      point: points.last,
+                      width: 16,
+                      height: 16,
+                      child: _dot(Colors.red),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+    );
+  }
+
+  static Widget _dot(Color c) => Container(
+        decoration: BoxDecoration(
+          color: c,
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white, width: 2),
+        ),
+      );
+}
+
 void main() {
   runApp(const XCTrainingApp());
 }
@@ -137,6 +241,17 @@ class _HomeScreenState extends State<HomeScreen> {
   Duration _elapsed = Duration.zero;
   StreamSubscription<Position>? _posSub;
   Timer? _tick;
+
+  // Map state for the Record page. _lastFix drives the "you are here" marker
+  // and camera follow; set by a one-shot fetch on entering the tab and by each
+  // recording fix.
+  final MapController _mapController = MapController();
+  LatLng? _lastFix;
+  bool _initialFixRequested = false;
+
+  // Cached future for the Runs tab — refreshed when the tab is opened so a
+  // just-saved run shows up, without re-reading the dir on every rebuild.
+  Future<List<_RunSummary>>? _runsFuture;
 
   // Bottom-nav page index. Page 0 = Home (production UI), page 1 = Debug
   // tools. The Debug page + its nav tab exist only in debug builds.
@@ -251,6 +366,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _posSub = Geolocator.getPositionStream(locationSettings: settings).listen(
       (pos) {
         if (!mounted) return;
+        final fix = LatLng(pos.latitude, pos.longitude);
         setState(() {
           if (_track.isNotEmpty) {
             final last = _track.last;
@@ -265,7 +381,9 @@ class _HomeScreenState extends State<HomeScreen> {
             altitude: pos.altitude,
             speed: pos.speed,
           ));
+          _lastFix = fix;
         });
+        _followCamera(fix); // keep the map centered on the runner
       },
       onError: (e) {
         if (!mounted) return;
@@ -333,6 +451,36 @@ class _HomeScreenState extends State<HomeScreen> {
     final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
     final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
     return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+
+  // Recenter the map on [target] at the current zoom. Guarded: MapController
+  // .move throws if the map widget isn't mounted yet.
+  void _followCamera(LatLng target) {
+    try {
+      _mapController.move(target, _mapController.camera.zoom);
+    } catch (_) {
+      // Map not ready — the next fix or the initial fit will catch up.
+    }
+  }
+
+  // One-shot current location when the Record tab first opens, so the map
+  // starts centered on the user rather than the default location.
+  Future<void> _ensureInitialFix() async {
+    if (_initialFixRequested) return;
+    _initialFixRequested = true;
+    if (!await _ensureLocationPermission()) {
+      _initialFixRequested = false; // let the user retry after granting
+      return;
+    }
+    try {
+      final pos = await Geolocator.getCurrentPosition();
+      if (!mounted) return;
+      final fix = LatLng(pos.latitude, pos.longitude);
+      setState(() => _lastFix = fix);
+      _followCamera(fix);
+    } catch (_) {
+      // Ignore — map stays at the fallback center until the first fix.
+    }
   }
 
   Future<void> _signInWithGoogle() async {
@@ -1433,38 +1581,62 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    // Page 0 = production Home. Page 1 = Debug tools (debug builds only).
+    // Tabs: Home, Record, Runs (always); Debug only in debug builds.
     final pages = <Widget>[
       _buildHomePage(theme),
+      _buildRecordPage(theme),
+      _buildRunsPage(theme),
       if (kDebugMode) _buildDebugPage(theme),
+    ];
+    final titles = <String>[
+      'XC Training Data',
+      'Record Run',
+      'My Runs',
+      if (kDebugMode) 'Debug Tools',
     ];
     final index = _pageIndex.clamp(0, pages.length - 1);
 
+    final destinations = <NavigationDestination>[
+      const NavigationDestination(
+        icon: Icon(Icons.home_outlined),
+        selectedIcon: Icon(Icons.home),
+        label: 'Home',
+      ),
+      const NavigationDestination(
+        icon: Icon(Icons.fiber_manual_record_outlined),
+        selectedIcon: Icon(Icons.fiber_manual_record),
+        label: 'Record',
+      ),
+      const NavigationDestination(
+        icon: Icon(Icons.route_outlined),
+        selectedIcon: Icon(Icons.route),
+        label: 'Runs',
+      ),
+      if (kDebugMode)
+        const NavigationDestination(
+          icon: Icon(Icons.bug_report_outlined),
+          selectedIcon: Icon(Icons.bug_report),
+          label: 'Debug',
+        ),
+    ];
+
     return Scaffold(
       appBar: AppBar(
-        title: Text(index == 0 ? 'XC Training Data' : 'Debug Tools'),
+        title: Text(titles[index]),
         centerTitle: true,
       ),
       body: pages[index],
-      // Only show the nav bar when there's more than one page (i.e. debug).
-      bottomNavigationBar: pages.length < 2
-          ? null
-          : NavigationBar(
-              selectedIndex: index,
-              onDestinationSelected: (i) => setState(() => _pageIndex = i),
-              destinations: const [
-                NavigationDestination(
-                  icon: Icon(Icons.home_outlined),
-                  selectedIcon: Icon(Icons.home),
-                  label: 'Home',
-                ),
-                NavigationDestination(
-                  icon: Icon(Icons.bug_report_outlined),
-                  selectedIcon: Icon(Icons.bug_report),
-                  label: 'Debug',
-                ),
-              ],
-            ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: index,
+        onDestinationSelected: (i) {
+          setState(() {
+            _pageIndex = i;
+            if (i == 1) _ensureInitialFix(); // Record tab
+            if (i == 2) _runsFuture = _loadRuns(); // Runs tab — refresh list
+          });
+        },
+        destinations: destinations,
+      ),
     );
   }
 
@@ -1486,55 +1658,213 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // GPS route recording card — independent of Health Connect permissions.
-  Widget _buildRecordCard(ThemeData theme) {
+  // Full-screen Record page: live map with a follow marker, the growing path
+  // polyline, live stats, and the Start/Stop control.
+  Widget _buildRecordPage(ThemeData theme) {
+    final trackPts = [for (final p in _track) LatLng(p.lat, p.lng)];
     final km = (_distanceMeters / 1000).toStringAsFixed(2);
-    return Card(
-      color: _recording ? theme.colorScheme.tertiaryContainer : null,
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+
+    return Stack(
+      children: [
+        FlutterMap(
+          mapController: _mapController,
+          options: MapOptions(
+            initialCenter: _lastFix ?? const LatLng(0, 0),
+            initialZoom: 16,
+          ),
           children: [
-            Row(
-              children: [
-                const Icon(Icons.route),
-                const SizedBox(width: 8),
-                Text('Record Run (GPS)', style: theme.textTheme.titleSmall),
-              ],
+            TileLayer(
+              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+              userAgentPackageName: 'com.github.briansp2020.xctraining',
             ),
-            if (_recording) ...[
-              const SizedBox(height: 16),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceAround,
-                children: [
-                  _recordStat(theme, _fmtDuration(_elapsed), 'time'),
-                  _recordStat(theme, km, 'km'),
-                  _recordStat(theme, '${_track.length}', 'points'),
+            if (trackPts.length >= 2)
+              PolylineLayer(
+                polylines: [
+                  Polyline(
+                    points: trackPts,
+                    strokeWidth: 5,
+                    color: theme.colorScheme.primary,
+                  ),
                 ],
               ),
-            ],
-            const SizedBox(height: 16),
-            if (!_recording)
-              FilledButton.icon(
-                onPressed: _startRecording,
-                icon: const Icon(Icons.play_arrow),
-                label: const Text('Start Run'),
-              )
-            else
-              FilledButton.icon(
-                onPressed: _stopRecording,
-                style: FilledButton.styleFrom(
-                  backgroundColor: theme.colorScheme.error,
-                  foregroundColor: theme.colorScheme.onError,
-                ),
-                icon: const Icon(Icons.stop),
-                label: const Text('Stop & Save'),
+            if (_lastFix != null)
+              MarkerLayer(
+                markers: [
+                  Marker(
+                    point: _lastFix!,
+                    width: 22,
+                    height: 22,
+                    child: _locationDot(theme.colorScheme.primary),
+                  ),
+                ],
               ),
           ],
         ),
+        if (_lastFix == null && !_recording)
+          const Positioned(
+            top: 16,
+            left: 16,
+            right: 16,
+            child: Card(
+              child: Padding(
+                padding: EdgeInsets.all(12),
+                child: Text('Locating you…'),
+              ),
+            ),
+          ),
+        if (_recording)
+          Positioned(
+            top: 16,
+            left: 16,
+            right: 16,
+            child: Card(
+              color: theme.colorScheme.tertiaryContainer,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceAround,
+                  children: [
+                    _recordStat(theme, _fmtDuration(_elapsed), 'time'),
+                    _recordStat(theme, km, 'km'),
+                    _recordStat(theme, '${_track.length}', 'points'),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        Positioned(
+          left: 24,
+          right: 24,
+          bottom: 24,
+          child: _recording
+              ? FilledButton.icon(
+                  onPressed: _stopRecording,
+                  icon: const Icon(Icons.stop),
+                  label: const Text('Stop & Save'),
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size.fromHeight(52),
+                    backgroundColor: theme.colorScheme.error,
+                    foregroundColor: theme.colorScheme.onError,
+                  ),
+                )
+              : FilledButton.icon(
+                  onPressed: _startRecording,
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('Start Run'),
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size.fromHeight(52),
+                  ),
+                ),
+        ),
+      ],
+    );
+  }
+
+  // A "you are here" dot for the map marker.
+  Widget _locationDot(Color color) {
+    return Container(
+      decoration: BoxDecoration(
+        color: color,
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white, width: 3),
       ),
     );
+  }
+
+  // Runs page: list of saved tracks, newest first. Tapping opens it on a map.
+  Widget _buildRunsPage(ThemeData theme) {
+    return FutureBuilder<List<_RunSummary>>(
+      future: _runsFuture ?? _loadRuns(),
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final runs = snap.data ?? [];
+        if (runs.isEmpty) {
+          return const Center(
+            child: Padding(
+              padding: EdgeInsets.all(32),
+              child: Text(
+                'No recorded runs yet.\nRecord one on the Record tab.',
+                textAlign: TextAlign.center,
+              ),
+            ),
+          );
+        }
+        return ListView.separated(
+          itemCount: runs.length,
+          separatorBuilder: (_, _) => const Divider(height: 1),
+          itemBuilder: (context, i) {
+            final r = runs[i];
+            return ListTile(
+              leading: const Icon(Icons.route),
+              title: Text(_fmtRunDate(r.start)),
+              subtitle: Text('${r.km.toStringAsFixed(2)} km · '
+                  '${_fmtDuration(r.duration)} · ${r.pointCount} pts'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => _openRun(r),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<List<_RunSummary>> _loadRuns() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final files = dir.listSync().whereType<File>().where((f) =>
+        f.path.endsWith('.json') && f.path.contains('xc_route_'));
+    final runs = <_RunSummary>[];
+    for (final f in files) {
+      try {
+        final m = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+        runs.add(_RunSummary(
+          file: f,
+          start: DateTime.parse(m['start_time'] as String),
+          km: (m['distance_meters'] as num).toDouble() / 1000,
+          duration: Duration(seconds: (m['duration_seconds'] as num).toInt()),
+          pointCount: (m['point_count'] as num).toInt(),
+        ));
+      } catch (_) {
+        // Skip malformed files.
+      }
+    }
+    runs.sort((a, b) => b.start.compareTo(a.start)); // newest first
+    return runs;
+  }
+
+  Future<void> _openRun(_RunSummary r) async {
+    try {
+      final m = jsonDecode(await r.file.readAsString()) as Map<String, dynamic>;
+      final pts = [
+        for (final p in (m['points'] as List))
+          LatLng((p['lat'] as num).toDouble(), (p['lng'] as num).toDouble()),
+      ];
+      if (!mounted) return;
+      await Navigator.of(context).push(MaterialPageRoute(
+        builder: (_) => _RunMapPage(
+          title: _fmtRunDate(r.start),
+          subtitle: '${r.km.toStringAsFixed(2)} km · '
+              '${_fmtDuration(r.duration)} · ${r.pointCount} points',
+          points: pts,
+        ),
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _status = 'Could not open run: $e');
+    }
+  }
+
+  String _fmtRunDate(DateTime utc) {
+    final d = utc.toLocal();
+    const months = [
+      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+    ];
+    final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+    final ampm = d.hour < 12 ? 'AM' : 'PM';
+    final min = d.minute.toString().padLeft(2, '0');
+    return '${months[d.month - 1]} ${d.day}, ${d.year}  $h:$min $ampm';
   }
 
   Widget _recordStat(ThemeData theme, String value, String label) {
@@ -1557,8 +1887,6 @@ class _HomeScreenState extends State<HomeScreen> {
           _buildAuthCard(theme),
           const SizedBox(height: 16),
           _buildStatusCard(theme),
-          const SizedBox(height: 16),
-          _buildRecordCard(theme),
           const SizedBox(height: 16),
           if (!_permissionsGranted)
             FilledButton.icon(

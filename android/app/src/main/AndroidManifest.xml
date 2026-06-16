@@ -1,5 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Needed for server sync and OpenStreetMap map tiles. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
     <!-- Health Connect read permissions.
          Note: the health package reads TotalCaloriesBurnedRecord (not Active) when
          aggregating workout calories, so READ_TOTAL_CALORIES_BURNED is required

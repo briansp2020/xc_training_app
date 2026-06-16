@@ -40,6 +40,8 @@ dependencies:
   path_provider: ^2.1.5
   google_sign_in: ^7.2.0
   geolocator: ^13.0.1 # DIY GPS route recording (foreground for now)
+  flutter_map: ^7.0.2 # OpenStreetMap-based map for the recording/runs pages
+  latlong2: ^0.9.1 # LatLng type used by flutter_map
 
 dev_dependencies:
   flutter_test:
