@@ -61,6 +61,10 @@ const Duration _firstSyncWindow = Duration(days: 30);
 // upsert dedup makes the duplicates harmless.
 const Duration _watermarkOverlap = Duration(hours: 1);
 
+// Zoom the Record map opens at, and snaps back to when the recenter button is
+// tapped. ~16 is a neighborhood-scale view.
+const double _recordMapZoom = 16;
+
 // One GPS fix in a recorded route. Serialized to the local track JSON; this
 // shape is what a future server route-upload endpoint will consume.
 class _TrackPoint {
@@ -522,7 +526,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _lastFix!.longitude,
     );
     if (offBy > 25) {
-      _mapController.move(_lastFix!, cam.zoom); // recenter on the user
+      _mapController.move(_lastFix!, _recordMapZoom); // recenter at default zoom
     } else {
       _mapController.rotate(0); // already centered → align north-up
     }
@@ -1740,7 +1744,7 @@ class _HomeScreenState extends State<HomeScreen> {
           mapController: _mapController,
           options: MapOptions(
             initialCenter: _lastFix ?? const LatLng(0, 0),
-            initialZoom: 16,
+            initialZoom: _recordMapZoom,
             onPositionChanged: (camera, hasGesture) {
               final centered = _lastFix == null
                   ? true
