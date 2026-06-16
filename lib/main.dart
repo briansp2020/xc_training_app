@@ -463,6 +463,25 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  // Recenter button: if the map has been panned away from the current
+  // location, recenter on it; if it's already centered, reset the bearing to
+  // north (handy after a two-finger rotate).
+  void _recenterOrAlignNorth() {
+    if (_lastFix == null) return;
+    final cam = _mapController.camera;
+    final offBy = Geolocator.distanceBetween(
+      cam.center.latitude,
+      cam.center.longitude,
+      _lastFix!.latitude,
+      _lastFix!.longitude,
+    );
+    if (offBy > 25) {
+      _mapController.move(_lastFix!, cam.zoom); // recenter on the user
+    } else {
+      _mapController.rotate(0); // already centered → align north-up
+    }
+  }
+
   // One-shot current location when the Record tab first opens, so the map
   // starts centered on the user rather than the default location.
   Future<void> _ensureInitialFix() async {
@@ -1730,6 +1749,17 @@ class _HomeScreenState extends State<HomeScreen> {
                   ],
                 ),
               ),
+            ),
+          ),
+        if (_lastFix != null)
+          Positioned(
+            right: 16,
+            bottom: 88,
+            child: FloatingActionButton.small(
+              heroTag: 'recenter',
+              onPressed: _recenterOrAlignNorth,
+              tooltip: 'Recenter / align north',
+              child: const Icon(Icons.my_location),
             ),
           ),
         Positioned(
