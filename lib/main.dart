@@ -546,13 +546,20 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     try {
-      final pos = await Geolocator.getCurrentPosition();
+      final pos = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 10),
+        ),
+      );
       if (!mounted) return;
       final fix = LatLng(pos.latitude, pos.longitude);
       setState(() => _lastFix = fix);
       _followCamera(fix);
     } catch (_) {
-      // Ignore — map stays at the fallback center until the first fix.
+      // Timed out or no fix — allow a retry next time the tab is opened so the
+      // map isn't stuck on the fallback center forever.
+      _initialFixRequested = false;
     }
   }
 
@@ -1655,19 +1662,31 @@ class _HomeScreenState extends State<HomeScreen> {
     final theme = Theme.of(context);
 
     // Tabs: Home, Record, Runs (always); Debug only in debug builds.
-    final pages = <Widget>[
-      _buildHomePage(theme),
-      _buildRecordPage(theme),
-      _buildRunsPage(theme),
-      if (kDebugMode) _buildDebugPage(theme),
-    ];
     final titles = <String>[
       'XC Training Data',
       'Record Run',
       'My Runs',
       if (kDebugMode) 'Debug Tools',
     ];
-    final index = _pageIndex.clamp(0, pages.length - 1);
+    final index = _pageIndex.clamp(0, titles.length - 1);
+
+    // Build only the active page. Building all of them every frame would re-run
+    // _buildRunsPage (which reads saved tracks from disk) on every setState —
+    // e.g. once per second while recording.
+    final Widget body;
+    switch (index) {
+      case 0:
+        body = _buildHomePage(theme);
+        break;
+      case 1:
+        body = _buildRecordPage(theme);
+        break;
+      case 2:
+        body = _buildRunsPage(theme);
+        break;
+      default:
+        body = _buildDebugPage(theme);
+    }
 
     final destinations = <NavigationDestination>[
       const NavigationDestination(
@@ -1698,7 +1717,7 @@ class _HomeScreenState extends State<HomeScreen> {
         title: Text(titles[index]),
         centerTitle: true,
       ),
-      body: pages[index],
+      body: body,
       bottomNavigationBar: NavigationBar(
         selectedIndex: index,
         onDestinationSelected: (i) {
