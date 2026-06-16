@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:ui' as ui; // Path is qualified to avoid latlong2's Path class
 
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
@@ -190,6 +192,45 @@ class _RunMapPage extends StatelessWidget {
       );
 }
 
+// A compass needle (red = north, grey = south) that counter-rotates with the
+// map so it keeps pointing at true north — like Google Maps' compass button.
+class _CompassNeedle extends StatelessWidget {
+  final double bearingDeg;
+  const _CompassNeedle({required this.bearingDeg});
+
+  @override
+  Widget build(BuildContext context) {
+    return Transform.rotate(
+      angle: -bearingDeg * math.pi / 180,
+      child: CustomPaint(size: const Size(18, 18), painter: _NeedlePainter()),
+    );
+  }
+}
+
+class _NeedlePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cx = size.width / 2;
+    final cy = size.height / 2;
+    final half = size.width * 0.28;
+    final north = ui.Path()
+      ..moveTo(cx, 0)
+      ..lineTo(cx - half, cy)
+      ..lineTo(cx + half, cy)
+      ..close();
+    final south = ui.Path()
+      ..moveTo(cx, size.height)
+      ..lineTo(cx - half, cy)
+      ..lineTo(cx + half, cy)
+      ..close();
+    canvas.drawPath(north, Paint()..color = const Color(0xFFD32F2F)); // N: red
+    canvas.drawPath(south, Paint()..color = const Color(0xFF9E9E9E)); // S: grey
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
 void main() {
   runApp(const XCTrainingApp());
 }
@@ -248,6 +289,11 @@ class _HomeScreenState extends State<HomeScreen> {
   final MapController _mapController = MapController();
   LatLng? _lastFix;
   bool _initialFixRequested = false;
+  // Tracked from the map's onPositionChanged so the recenter button can reflect
+  // state: crosshair when off-center, compass (needle to north) when centered
+  // but rotated.
+  double _mapRotation = 0;
+  bool _mapCentered = true;
 
   // Cached future for the Runs tab — refreshed when the tab is opened so a
   // just-saved run shows up, without re-reading the dir on every rebuild.
@@ -1682,6 +1728,11 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget _buildRecordPage(ThemeData theme) {
     final trackPts = [for (final p in _track) LatLng(p.lat, p.lng)];
     final km = (_distanceMeters / 1000).toStringAsFixed(2);
+    // Show a compass (needle to north) when centered but rotated; otherwise the
+    // crosshair for "recenter on me".
+    final norm = ((_mapRotation % 360) + 360) % 360;
+    final aligned = norm < 0.5 || norm > 359.5;
+    final showCompass = _mapCentered && !aligned;
 
     return Stack(
       children: [
@@ -1690,6 +1741,24 @@ class _HomeScreenState extends State<HomeScreen> {
           options: MapOptions(
             initialCenter: _lastFix ?? const LatLng(0, 0),
             initialZoom: 16,
+            onPositionChanged: (camera, hasGesture) {
+              final centered = _lastFix == null
+                  ? true
+                  : Geolocator.distanceBetween(
+                        camera.center.latitude,
+                        camera.center.longitude,
+                        _lastFix!.latitude,
+                        _lastFix!.longitude,
+                      ) <=
+                      25;
+              if (camera.rotation != _mapRotation ||
+                  centered != _mapCentered) {
+                setState(() {
+                  _mapRotation = camera.rotation;
+                  _mapCentered = centered;
+                });
+              }
+            },
           ),
           children: [
             TileLayer(
@@ -1758,8 +1827,10 @@ class _HomeScreenState extends State<HomeScreen> {
             child: FloatingActionButton.small(
               heroTag: 'recenter',
               onPressed: _recenterOrAlignNorth,
-              tooltip: 'Recenter / align north',
-              child: const Icon(Icons.my_location),
+              tooltip: showCompass ? 'Align north' : 'Recenter on me',
+              child: showCompass
+                  ? _CompassNeedle(bearingDeg: _mapRotation)
+                  : const Icon(Icons.my_location),
             ),
           ),
         Positioned(
