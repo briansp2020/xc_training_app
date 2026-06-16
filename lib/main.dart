@@ -62,8 +62,8 @@ const Duration _firstSyncWindow = Duration(days: 30);
 const Duration _watermarkOverlap = Duration(hours: 1);
 
 // Zoom the Record map opens at, and snaps back to when the recenter button is
-// tapped. ~16 is a neighborhood-scale view.
-const double _recordMapZoom = 16;
+// tapped. 18 is a tight, street-level view.
+const double _recordMapZoom = 18;
 
 // One GPS fix in a recorded route. Serialized to the local track JSON; this
 // shape is what a future server route-upload endpoint will consume.
@@ -527,8 +527,12 @@ class _HomeScreenState extends State<HomeScreen> {
     );
     if (offBy > 25) {
       _mapController.move(_lastFix!, _recordMapZoom); // recenter at default zoom
+      setState(() => _mapCentered = true);
     } else {
       _mapController.rotate(0); // already centered → align north-up
+      // Update state directly: a programmatic rotate doesn't reliably fire
+      // onPositionChanged, so the needle would otherwise stay tilted.
+      setState(() => _mapRotation = 0);
     }
   }
 
