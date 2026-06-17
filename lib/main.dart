@@ -292,7 +292,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   final Health _health = Health();
   final AuthService _auth = AuthService(
     serverBase: _serverBase,
@@ -375,6 +375,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _bootstrap();
   }
 
@@ -389,10 +390,25 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _posSub?.cancel();
     _previewSub?.cancel();
     _tick?.cancel();
     super.dispose();
+  }
+
+  // Stop the idle location preview when the app is backgrounded, and resume it
+  // on return (only if we're on the Record tab and not recording). A recording
+  // run is left alone — its foreground service is meant to keep GPS alive while
+  // backgrounded.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (_recording) return;
+    if (state == AppLifecycleState.resumed) {
+      if (_pageIndex == 1) _startLocationPreview();
+    } else if (state == AppLifecycleState.paused) {
+      _stopLocationPreview();
+    }
   }
 
   // ---- DIY GPS route recording (Milestone A: foreground + local save) ----
