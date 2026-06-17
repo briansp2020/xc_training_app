@@ -65,6 +65,31 @@ const Duration _watermarkOverlap = Duration(hours: 1);
 // tapped. 18 is a tight, street-level view.
 const double _recordMapZoom = 18;
 
+// Moving-average window for smoothing the *displayed* GPS path — tames the
+// zigzag from slow walking / GPS jitter. Raw points are kept intact for upload;
+// only the drawn polyline is smoothed. Higher = smoother but rounds corners
+// more; set to 1 to disable.
+const int _pathSmoothingWindow = 7;
+
+// Returns a smoothed copy of [pts] using a centered moving average. Endpoints
+// are preserved (the window shrinks at the edges).
+List<LatLng> smoothPath(List<LatLng> pts, {int window = _pathSmoothingWindow}) {
+  if (pts.length <= 2 || window < 2) return pts;
+  final half = window ~/ 2;
+  final out = <LatLng>[];
+  for (var i = 0; i < pts.length; i++) {
+    var lat = 0.0, lng = 0.0, n = 0;
+    for (var j = i - half; j <= i + half; j++) {
+      if (j < 0 || j >= pts.length) continue;
+      lat += pts[j].latitude;
+      lng += pts[j].longitude;
+      n++;
+    }
+    out.add(LatLng(lat / n, lng / n));
+  }
+  return out;
+}
+
 // One GPS fix in a recorded route. Serialized to the local track JSON; this
 // shape is what a future server route-upload endpoint will consume.
 class _TrackPoint {
@@ -160,7 +185,7 @@ class _RunMapPage extends StatelessWidget {
                 PolylineLayer(
                   polylines: [
                     Polyline(
-                      points: points,
+                      points: smoothPath(points),
                       strokeWidth: 5,
                       color: theme.colorScheme.primary,
                     ),
@@ -1811,7 +1836,7 @@ class _HomeScreenState extends State<HomeScreen> {
               PolylineLayer(
                 polylines: [
                   Polyline(
-                    points: trackPts,
+                    points: smoothPath(trackPts),
                     strokeWidth: 5,
                     color: theme.colorScheme.primary,
                   ),
