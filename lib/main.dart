@@ -55,6 +55,11 @@ const String _clientVersion = '1.0.0+1';
 const String _lastSyncPrefsKey = 'last_sync_at';
 const Duration _firstSyncWindow = Duration(days: 30);
 
+// shared_preferences key — filenames of route tracks already uploaded to the
+// server, so Sync only sends new ones. (Server dedup is idempotent anyway; this
+// just avoids re-POSTing every track on every sync.)
+const String _uploadedRoutesPrefsKey = 'uploaded_route_files';
+
 // Re-query a small overlap behind the watermark on every incremental sync,
 // to catch late-arriving Health Connect samples (Fitbit can batch-deliver
 // data 30-60 minutes after the sensor reading happened). Server's UUID
@@ -1630,13 +1635,33 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
+      // Also upload any recorded GPS route tracks (see SERVER_SCHEMA.md
+      // "Route tracks"). Independent of the health upload above.
+      setState(() => _status = 'Uploading recorded routes...');
+      final routes = await _uploadRouteTracks(prefs);
+      if (!mounted) return;
+      if (routes.unauthorized) {
+        await _auth.invalidate();
+        if (!mounted) return;
+        setState(() {
+          _uploading = false;
+          _status = 'Sign-in expired. Please sign in again, then re-tap Sync.';
+        });
+        return;
+      }
+
+      final routeMsg = (routes.uploaded == 0 && routes.failed == 0)
+          ? ' No new routes.'
+          : ' Routes: ${routes.uploaded} uploaded'
+              '${routes.failed > 0 ? ", ${routes.failed} failed" : ""}.';
       setState(() {
         _uploading = false;
         if (ok) {
           _status =
-              'Synced $sizeMB MB ($windowLabel): $workoutCount workouts, $totalSamples samples. Server: ${response.statusCode}.';
+              'Synced $sizeMB MB ($windowLabel): $workoutCount workouts, $totalSamples samples. Server: ${response.statusCode}.$routeMsg';
         } else {
-          _status = 'Upload failed: ${response.statusCode}\n${response.body}';
+          _status =
+              'Health upload failed: ${response.statusCode}.$routeMsg\n${response.body}';
         }
       });
     } catch (e) {
@@ -1646,6 +1671,64 @@ class _HomeScreenState extends State<HomeScreen> {
         _status = 'Sync error: $e';
       });
     }
+  }
+
+  // Uploads saved route tracks the client hasn't sent yet to POST /routes,
+  // tracking which filenames are done in shared_preferences. Files stay on
+  // device (so the Runs tab keeps them); failures are retried next sync.
+  Future<({int uploaded, int failed, bool unauthorized})> _uploadRouteTracks(
+      SharedPreferences prefs) async {
+    final dir = await getApplicationDocumentsDirectory();
+    final files = dir.listSync().whereType<File>().where((f) =>
+        f.path.endsWith('.json') && f.path.contains('xc_route_'));
+    final done = (prefs.getStringList(_uploadedRoutesPrefsKey) ?? []).toSet();
+    var uploaded = 0;
+    var failed = 0;
+    for (final f in files) {
+      final name = f.uri.pathSegments.last;
+      if (done.contains(name)) continue; // already uploaded
+      try {
+        final body = await f.readAsString();
+        final resp = await http
+            .post(
+              Uri.parse('$_serverBase/routes'),
+              headers: {
+                'Content-Type': 'application/json',
+                ..._auth.authHeaders,
+              },
+              body: body,
+            )
+            .timeout(const Duration(seconds: 60));
+        if (resp.statusCode == 401) {
+          await prefs.setStringList(_uploadedRoutesPrefsKey, done.toList());
+          return (uploaded: uploaded, failed: failed, unauthorized: true);
+        }
+        if (resp.statusCode >= 200 && resp.statusCode < 300) {
+          done.add(name);
+          uploaded++;
+        } else {
+          failed++;
+        }
+      } catch (_) {
+        failed++; // network/timeout — retried next sync
+      }
+    }
+    await prefs.setStringList(_uploadedRoutesPrefsKey, done.toList());
+    return (uploaded: uploaded, failed: failed, unauthorized: false);
+  }
+
+  // Debug: rewind the health sync watermark 24h AND clear the route-upload
+  // tracking, so the next Sync re-uploads the last day of health data plus all
+  // saved route tracks (server dedup makes both re-uploads idempotent).
+  Future<void> _resetSyncWatermark() async {
+    final prefs = await SharedPreferences.getInstance();
+    final t = DateTime.now().subtract(const Duration(hours: 24));
+    await prefs.setString(_lastSyncPrefsKey, t.toUtc().toIso8601String());
+    await prefs.remove(_uploadedRoutesPrefsKey); // re-send saved routes too
+    if (!mounted) return;
+    setState(() => _status =
+        'Reset: health watermark −24h and route-upload tracking cleared. '
+        'Next Sync re-uploads the last day + all saved routes.');
   }
 
   Future<void> _readHeartRate() async {
@@ -2217,6 +2300,10 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
             ),
+          // Independent of health permissions — just rewinds the sync watermark.
+          debugButton(Icons.history, 'Reset Sync (-24h + routes)',
+              _resetSyncWatermark),
+          const SizedBox(height: 8),
           if (_permissionsGranted) ...[
             debugButton(
                 Icons.search, 'Discover Workout Data', _discoverWorkoutData),
