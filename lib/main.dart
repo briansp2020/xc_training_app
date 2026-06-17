@@ -288,11 +288,12 @@ class _HomeScreenState extends State<HomeScreen> {
   Timer? _tick;
 
   // Map state for the Record page. _lastFix drives the "you are here" marker
-  // and camera follow; set by a one-shot fetch on entering the tab and by each
-  // recording fix.
+  // and camera follow; updated by a live preview stream while on the tab (idle)
+  // and by each recording fix.
   final MapController _mapController = MapController();
   LatLng? _lastFix;
-  bool _initialFixRequested = false;
+  // Idle location preview stream (Record tab, not recording).
+  StreamSubscription<Position>? _previewSub;
   // Tracked from the map's onPositionChanged so the recenter button can reflect
   // state: crosshair when off-center, compass (needle to north) when centered
   // but rotated.
@@ -359,6 +360,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _posSub?.cancel();
+    _previewSub?.cancel();
     _tick?.cancel();
     super.dispose();
   }
@@ -388,6 +390,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _startRecording() async {
     if (!await _ensureLocationPermission()) return;
     if (!mounted) return;
+    _stopLocationPreview(); // the recording stream takes over
     setState(() {
       _recording = true;
       _track.clear();
@@ -456,6 +459,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final points = _track.toList();
     if (!mounted) return;
     setState(() => _recording = false);
+    if (_pageIndex == 1) _startLocationPreview(); // resume idle preview
 
     if (points.isEmpty) {
       setState(() => _status = 'Stopped — no GPS fixes captured.');
@@ -536,31 +540,37 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // One-shot current location when the Record tab first opens, so the map
-  // starts centered on the user rather than the default location.
-  Future<void> _ensureInitialFix() async {
-    if (_initialFixRequested) return;
-    _initialFixRequested = true;
-    if (!await _ensureLocationPermission()) {
-      _initialFixRequested = false; // let the user retry after granting
+  // Live location preview while on the Record tab and NOT recording, so the
+  // marker keeps tracking the user. Plain (non-foreground) stream: Android
+  // pauses it when the app is backgrounded, and we stop it when leaving the tab
+  // or when recording starts — so it isn't a battery sink.
+  Future<void> _startLocationPreview() async {
+    if (_recording || _previewSub != null) return;
+    if (!await _ensureLocationPermission()) return;
+    // State may have changed during the permission await.
+    if (!mounted || _recording || _previewSub != null || _pageIndex != 1) {
       return;
     }
-    try {
-      final pos = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: Duration(seconds: 10),
-        ),
-      );
-      if (!mounted) return;
-      final fix = LatLng(pos.latitude, pos.longitude);
-      setState(() => _lastFix = fix);
-      _followCamera(fix);
-    } catch (_) {
-      // Timed out or no fix — allow a retry next time the tab is opened so the
-      // map isn't stuck on the fallback center forever.
-      _initialFixRequested = false;
-    }
+    _previewSub = Geolocator.getPositionStream(
+      locationSettings: const LocationSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 10,
+      ),
+    ).listen(
+      (pos) {
+        if (!mounted) return;
+        final fix = LatLng(pos.latitude, pos.longitude);
+        setState(() => _lastFix = fix);
+        // Follow only if centered, so panning the idle map isn't yanked back.
+        if (_mapCentered) _followCamera(fix);
+      },
+      onError: (_) {},
+    );
+  }
+
+  void _stopLocationPreview() {
+    _previewSub?.cancel();
+    _previewSub = null;
   }
 
   Future<void> _signInWithGoogle() async {
@@ -1723,9 +1733,14 @@ class _HomeScreenState extends State<HomeScreen> {
         onDestinationSelected: (i) {
           setState(() {
             _pageIndex = i;
-            if (i == 1) _ensureInitialFix(); // Record tab
             if (i == 2) _runsFuture = _loadRuns(); // Runs tab — refresh list
           });
+          // Run the idle location preview only while on the Record tab.
+          if (i == 1) {
+            _startLocationPreview();
+          } else {
+            _stopLocationPreview();
+          }
         },
         destinations: destinations,
       ),
