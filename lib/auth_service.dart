@@ -177,7 +177,14 @@ class AuthService {
     final data = jsonDecode(body) as Map<String, dynamic>;
     final athlete =
         (data['athlete'] as Map?)?.cast<String, dynamic>() ?? const {};
-    _token = data['access_token'] as String?;
+    final token = data['access_token'] as String?;
+    if (token == null || token.isEmpty) {
+      // A 200 with no usable token is a server contract violation — surface it
+      // as an error instead of reporting a false "signed in". The callers' outer
+      // try/catch turns this into a user-visible message.
+      throw const FormatException('Server response missing access_token');
+    }
+    _token = token;
     _email = athlete['email'] as String?;
     _name = athlete['name'] as String? ?? athlete['display_name'] as String?;
     _issuedAt = DateTime.now();

@@ -60,11 +60,14 @@ const Duration _firstSyncWindow = Duration(days: 30);
 // just avoids re-POSTing every track on every sync.)
 const String _uploadedRoutesPrefsKey = 'uploaded_route_files';
 
-// Re-query a small overlap behind the watermark on every incremental sync,
-// to catch late-arriving Health Connect samples (Fitbit can batch-deliver
-// data 30-60 minutes after the sensor reading happened). Server's UUID
-// upsert dedup makes the duplicates harmless.
-const Duration _watermarkOverlap = Duration(hours: 1);
+// Re-query an overlap behind the watermark on every incremental sync, to catch
+// late-arriving Health Connect samples. The watermark is a single global max
+// across all streams, so live HR pins it near "now"; but Fitbit derives resting
+// HR, HRV, and sleep from overnight data and delivers them hours late, with a
+// dateTo well behind that global max. A 1h overlap missed them — use 24h so a
+// late-delivered sample still falls inside the next sync's window. The server's
+// UUID upsert dedup makes the wider re-query harmless.
+const Duration _watermarkOverlap = Duration(hours: 24);
 
 // Zoom the Record map opens at, and snaps back to when the recenter button is
 // tapped. 18 is a tight, street-level view.
@@ -75,6 +78,14 @@ const double _recordMapZoom = 18;
 // only the drawn polyline is smoothed. Higher = smoother but rounds corners
 // more; set to 1 to disable.
 const int _pathSmoothingWindow = 7;
+
+// Recording-quality gates. Drop fixes worse than _gpsAccuracyThresholdM meters
+// (a poor fix scatters the path and inflates distance), and reject any leg
+// implying a speed above _gpsMaxSpeedMps — a GPS multipath spike, not real
+// movement (~12 m/s is faster than a world-class sprint, so legit running is
+// never dropped). These guard the recorded distance metric only.
+const double _gpsAccuracyThresholdM = 25;
+const double _gpsMaxSpeedMps = 12;
 
 // Returns a smoothed copy of [pts] using a centered moving average. Endpoints
 // are preserved (the window shrinks at the edges).
@@ -310,6 +321,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // DIY GPS route recording (foreground only for now). _track accumulates fixes
   // while _recording; _distanceMeters is summed incrementally between fixes.
   bool _recording = false;
+  bool _startingRun = false; // re-entrancy guard for _startRecording
   final List<_TrackPoint> _track = [];
   double _distanceMeters = 0;
   DateTime? _recordStart;
@@ -322,6 +334,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // and by each recording fix.
   final MapController _mapController = MapController();
   LatLng? _lastFix;
+  // Last idle-preview GPS error, shown in the Record map banner instead of an
+  // indefinite "Locating you…" when no fix has arrived yet. Cleared on a fix.
+  String? _gpsError;
   // Idle location preview stream (Record tab, not recording).
   StreamSubscription<Position>? _previewSub;
   // Tracked from the map's onPositionChanged so the recenter button can reflect
@@ -329,6 +344,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // but rotated.
   double _mapRotation = 0;
   bool _mapCentered = true;
+
+  // Memoized smoothed polyline for the Record map, keyed on _track.length so a
+  // per-second timer tick doesn't re-run the O(n·window) smoothing when the
+  // track hasn't grown. Points are only ever appended, so length is a
+  // sufficient invalidation key.
+  List<LatLng> _smoothedTrack = const [];
+  int _smoothedAtLength = -1;
 
   // Cached future for the Runs tab — refreshed when the tab is opened so a
   // just-saved run shows up, without re-reading the dir on every rebuild.
@@ -394,6 +416,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     _posSub?.cancel();
     _previewSub?.cancel();
     _tick?.cancel();
+    _mapController.dispose();
     super.dispose();
   }
 
@@ -434,66 +457,86 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _startRecording() async {
-    if (!await _ensureLocationPermission()) return;
-    if (!mounted) return;
-    _stopLocationPreview(); // the recording stream takes over
-    setState(() {
-      _recording = true;
-      _track.clear();
-      _distanceMeters = 0;
-      _elapsed = Duration.zero;
-      _recordStart = DateTime.now();
-      _status = 'Recording run — you can lock the screen; '
-          'a notification keeps it tracking.';
-    });
+    // Guard re-entrancy: _recording isn't set until after the permission await
+    // below, so a fast double-tap (or a tap during the permission dialog) could
+    // otherwise start a second stream + timer and orphan the first. _startingRun
+    // is set synchronously, before the first await.
+    if (_recording || _startingRun) return;
+    _startingRun = true;
+    try {
+      if (!await _ensureLocationPermission()) return;
+      if (!mounted) return;
+      _stopLocationPreview(); // the recording stream takes over
+      setState(() {
+        _recording = true;
+        _track.clear();
+        _distanceMeters = 0;
+        _elapsed = Duration.zero;
+        _recordStart = DateTime.now();
+        _status = 'Recording run — you can lock the screen; '
+            'a notification keeps it tracking.';
+      });
 
-    // AndroidSettings (vs plain LocationSettings) lets geolocator promote its
-    // location service to a foreground service via foregroundNotificationConfig,
-    // which is what keeps GPS flowing with the screen off / app backgrounded.
-    // iOS would need AppleSettings here when iOS support is added.
-    final settings = AndroidSettings(
-      accuracy: LocationAccuracy.high,
-      distanceFilter: 5, // meters between fixes — filters GPS jitter at rest
-      foregroundNotificationConfig: const ForegroundNotificationConfig(
-        notificationTitle: 'XC Training — recording run',
-        notificationText: 'Tracking your GPS route',
-        notificationChannelName: 'Run recording',
-        enableWakeLock: true, // keep the CPU awake for GPS while screen is off
-        setOngoing: true, // can't be swiped away mid-run
-      ),
-    );
-    _posSub = Geolocator.getPositionStream(locationSettings: settings).listen(
-      (pos) {
-        if (!mounted) return;
-        final fix = LatLng(pos.latitude, pos.longitude);
-        setState(() {
+      // AndroidSettings (vs plain LocationSettings) lets geolocator promote its
+      // location service to a foreground service via foregroundNotificationConfig,
+      // which is what keeps GPS flowing with the screen off / app backgrounded.
+      // iOS would need AppleSettings here when iOS support is added.
+      final settings = AndroidSettings(
+        accuracy: LocationAccuracy.high,
+        distanceFilter: 5, // meters between fixes — filters GPS jitter at rest
+        foregroundNotificationConfig: const ForegroundNotificationConfig(
+          notificationTitle: 'XC Training — recording run',
+          notificationText: 'Tracking your GPS route',
+          notificationChannelName: 'Run recording',
+          enableWakeLock: true, // keep the CPU awake for GPS while screen is off
+          setOngoing: true, // can't be swiped away mid-run
+        ),
+      );
+      _posSub = Geolocator.getPositionStream(locationSettings: settings).listen(
+        (pos) {
+          if (!mounted) return;
+          // Drop low-quality fixes — a poor-accuracy fix scatters the path and
+          // its out-and-back leg inflates the recorded distance.
+          if (pos.accuracy > _gpsAccuracyThresholdM) return;
+          final fix = LatLng(pos.latitude, pos.longitude);
+          double? leg;
           if (_track.isNotEmpty) {
             final last = _track.last;
-            _distanceMeters += Geolocator.distanceBetween(
+            leg = Geolocator.distanceBetween(
                 last.lat, last.lng, pos.latitude, pos.longitude);
+            // Reject implausible jumps (GPS multipath spikes): a leg implying a
+            // speed no runner can hit is a bad fix, not real distance.
+            final dt =
+                pos.timestamp.difference(last.time).inMilliseconds / 1000.0;
+            if (dt > 0 && leg / dt > _gpsMaxSpeedMps) return;
           }
-          _track.add(_TrackPoint(
-            lat: pos.latitude,
-            lng: pos.longitude,
-            time: pos.timestamp,
-            accuracy: pos.accuracy,
-            altitude: pos.altitude,
-            speed: pos.speed,
-          ));
-          _lastFix = fix;
-        });
-        _followCamera(fix); // keep the map centered on the runner
-      },
-      onError: (e) {
-        if (!mounted) return;
-        setState(() => _status = 'GPS error: $e');
-      },
-    );
+          setState(() {
+            if (leg != null) _distanceMeters += leg;
+            _track.add(_TrackPoint(
+              lat: pos.latitude,
+              lng: pos.longitude,
+              time: pos.timestamp,
+              accuracy: pos.accuracy,
+              altitude: pos.altitude,
+              speed: pos.speed,
+            ));
+            _lastFix = fix;
+          });
+          _followCamera(fix); // keep the map centered on the runner
+        },
+        onError: (e) {
+          if (!mounted) return;
+          setState(() => _status = 'GPS error: $e');
+        },
+      );
 
-    _tick = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (!mounted || _recordStart == null) return;
-      setState(() => _elapsed = DateTime.now().difference(_recordStart!));
-    });
+      _tick = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (!mounted || _recordStart == null) return;
+        setState(() => _elapsed = DateTime.now().difference(_recordStart!));
+      });
+    } finally {
+      _startingRun = false;
+    }
   }
 
   Future<void> _stopRecording() async {
@@ -539,6 +582,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() {
         _status = 'Saved run: ${(_distanceMeters / 1000).toStringAsFixed(2)} km, '
             '${_fmtDuration(duration)}, ${points.length} points\n→ ${file.path}';
+        // The run is saved (from the points snapshot above) — clear the live
+        // track so its polyline doesn't linger on the idle preview map. Keep
+        // _lastFix so the "you are here" marker still tracks the user.
+        _track.clear();
+        _distanceMeters = 0;
       });
     } catch (e) {
       if (!mounted) return;
@@ -606,11 +654,20 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       (pos) {
         if (!mounted) return;
         final fix = LatLng(pos.latitude, pos.longitude);
-        setState(() => _lastFix = fix);
+        setState(() {
+          _lastFix = fix;
+          _gpsError = null; // a fix arrived — clear any prior preview error
+        });
         // Follow only if centered, so panning the idle map isn't yanked back.
         if (_mapCentered) _followCamera(fix);
       },
-      onError: (_) {},
+      // Don't swallow it: surface in the Record banner (and the dev console) so
+      // a broken preview doesn't sit on "Locating you…" forever.
+      onError: (e) {
+        debugPrint('[preview] GPS error: $e');
+        if (!mounted) return;
+        setState(() => _gpsError = 'GPS unavailable: $e');
+      },
     );
   }
 
@@ -630,40 +687,45 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> _signInWithDevEmail() async {
     final controller = TextEditingController(text: _auth.email ?? '');
-    final email = await showDialog<String>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Dev sign-in'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Email to sign in as. The server must be running '
-                'with DEV_MODE=true for this to work.'),
-            const SizedBox(height: 12),
-            TextField(
-              controller: controller,
-              keyboardType: TextInputType.emailAddress,
-              decoration: const InputDecoration(
-                labelText: 'Email',
-                hintText: 'you@example.com',
+    final String? email;
+    try {
+      email = await showDialog<String>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Dev sign-in'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Email to sign in as. The server must be running '
+                  'with DEV_MODE=true for this to work.'),
+              const SizedBox(height: 12),
+              TextField(
+                controller: controller,
+                keyboardType: TextInputType.emailAddress,
+                decoration: const InputDecoration(
+                  labelText: 'Email',
+                  hintText: 'you@example.com',
+                ),
+                autofocus: true,
               ),
-              autofocus: true,
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(ctx).pop(controller.text),
+              child: const Text('Sign in'),
             ),
           ],
         ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(controller.text),
-            child: const Text('Sign in'),
-          ),
-        ],
-      ),
-    );
+      );
+    } finally {
+      controller.dispose();
+    }
     if (email == null || email.trim().isEmpty) return;
     if (!mounted) return;
     setState(() => _status = 'Signing in as $email...');
@@ -1723,9 +1785,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           done.add(name);
           uploaded++;
         } else {
+          debugPrint('[routes] $name rejected: ${resp.statusCode} ${resp.body}');
           failed++;
         }
-      } catch (_) {
+      } catch (e) {
+        debugPrint('[routes] upload of $name failed: $e');
         failed++; // network/timeout — retried next sync
       }
     }
@@ -1891,8 +1955,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // Full-screen Record page: live map with a follow marker, the growing path
   // polyline, live stats, and the Start/Stop control.
+  // Smoothed polyline for the Record map, recomputed only when the track grows.
+  List<LatLng> _recordPolyline() {
+    if (_smoothedAtLength != _track.length) {
+      _smoothedAtLength = _track.length;
+      _smoothedTrack =
+          smoothPath([for (final p in _track) LatLng(p.lat, p.lng)]);
+    }
+    return _smoothedTrack;
+  }
+
   Widget _buildRecordPage(ThemeData theme) {
-    final trackPts = [for (final p in _track) LatLng(p.lat, p.lng)];
+    final polyline = _recordPolyline();
     final km = (_distanceMeters / 1000).toStringAsFixed(2);
     // Show the compass whenever the map is centered on the user — the needle
     // points straight up/down when aligned to north, and rotates to true north
@@ -1931,11 +2005,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
               userAgentPackageName: 'com.github.briansp2020.xctraining',
             ),
-            if (trackPts.length >= 2)
+            if (polyline.length >= 2)
               PolylineLayer(
                 polylines: [
                   Polyline(
-                    points: smoothPath(trackPts),
+                    points: polyline,
                     strokeWidth: 5,
                     color: theme.colorScheme.primary,
                   ),
@@ -1955,14 +2029,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           ],
         ),
         if (_lastFix == null && !_recording)
-          const Positioned(
+          Positioned(
             top: 16,
             left: 16,
             right: 16,
             child: Card(
               child: Padding(
-                padding: EdgeInsets.all(12),
-                child: Text('Locating you…'),
+                padding: const EdgeInsets.all(12),
+                child: Text(_gpsError ?? 'Locating you…'),
               ),
             ),
           ),
