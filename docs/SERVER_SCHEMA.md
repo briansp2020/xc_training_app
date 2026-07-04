@@ -604,6 +604,60 @@ async def post_route(payload: RouteTrack):
 
 ---
 
+## Data reset (dev)
+
+`DELETE <base>/me/data` — deletes **everything the authenticated athlete has
+uploaded**: workouts, every raw sample stream, detected sessions, and route
+tracks. The athlete comes from the Bearer token like every other endpoint.
+
+The app's debug **Reset (wipe server + start over)** button calls this and,
+only after a 2xx, clears its local sync state (watermark + route-upload
+dedup) — so the next Sync re-uploads the full first-sync window and every
+saved route from scratch.
+
+No body, no query params. Responses:
+
+- `200` with per-table delete counts (shape below). The client displays the
+  raw JSON in its status card; it doesn't parse specific keys, so include
+  whatever tables your schema has.
+- `401` — invalid/expired token (client drops the token and re-prompts
+  sign-in).
+
+```json
+{"deleted": {"workouts": 16, "heart_rate_samples": 165204, "step_samples": 8123, "route_tracks": 3}}
+```
+
+### Example FastAPI handler
+
+```python
+ATHLETE_TABLES = [
+    # children first if you added FKs to workouts/detected_sessions
+    "detected_sessions",
+    "heart_rate_samples", "step_samples", "distance_samples",
+    "active_energy_samples", "total_calorie_samples",
+    "hrv_rmssd_samples", "resting_heart_rate_samples",
+    "respiratory_rate_samples", "sleep_sessions", "sleep_stage_samples",
+    "workouts", "route_tracks",
+]
+
+@app.delete("/me/data")
+async def delete_my_data(athlete_id: int = Depends(athlete_from_token)):
+    counts = {}
+    for table in ATHLETE_TABLES:
+        result = await db.execute(
+            text(f"DELETE FROM {table} WHERE athlete_id = :a"),  # table names from our list, not user input
+            {"a": athlete_id},
+        )
+        counts[table] = result.rowcount
+    return {"deleted": counts}
+```
+
+Scope it to the token's athlete only — this must never be able to touch
+another athlete's rows. It's a dev convenience; consider disabling it (or
+requiring `DEV_MODE=true`) in production.
+
+---
+
 ## Future work
 
 - **Background sync** via WorkManager (no need to open the app).

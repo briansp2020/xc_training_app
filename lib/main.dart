@@ -1543,20 +1543,41 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     };
   }
 
+  // Max time span per Health Connect query. The plugin serializes each read's
+  // ENTIRE result into one method-channel envelope on the Java heap; a full
+  // 30-day window of heart-rate data (165k+ samples) OOM-crashed the app even
+  // with largeHeap, so long windows are read in slices this wide and stitched
+  // together on the Dart side.
+  static const Duration _readChunk = Duration(days: 3);
+
   Future<List<HealthDataPoint>> _safeRead(
       HealthDataType t, DateTime start, DateTime end) async {
-    try {
-      return await _health.getHealthDataFromTypes(
-        types: [t],
-        startTime: start,
-        endTime: end,
-      );
-    } catch (e, st) {
-      // Don't crash the caller — expected for unpermissioned types — but
-      // log so it's still visible in the dev console.
-      debugPrint('[_safeRead] ${t.name} failed: $e\n$st');
-      return [];
+    final out = <HealthDataPoint>[];
+    // Records overlapping a slice boundary are returned by both slices —
+    // dedup by uuid so callers see each record once.
+    final seen = <String>{};
+    var cursor = start;
+    while (cursor.isBefore(end)) {
+      var sliceEnd = cursor.add(_readChunk);
+      if (sliceEnd.isAfter(end)) sliceEnd = end;
+      try {
+        final slice = await _health.getHealthDataFromTypes(
+          types: [t],
+          startTime: cursor,
+          endTime: sliceEnd,
+        );
+        for (final p in slice) {
+          if (seen.add(p.uuid)) out.add(p);
+        }
+      } catch (e, st) {
+        // Don't crash the caller — expected for unpermissioned types — but
+        // log so it's still visible in the dev console.
+        debugPrint(
+            '[_safeRead] ${t.name} $cursor..$sliceEnd failed: $e\n$st');
+      }
+      cursor = sliceEnd;
     }
+    return out;
   }
 
   // Streams uploaded in full across the entire sync window — independent of
@@ -1989,19 +2010,90 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  // Debug: rewind the health sync watermark 24h AND clear the route-upload
-  // tracking, so the next Sync re-uploads the last day of health data plus all
-  // saved route tracks (server dedup makes both re-uploads idempotent).
+  // Debug: full start-over. Asks the server to delete EVERYTHING this athlete
+  // has uploaded (DELETE /me/data — see SERVER_SCHEMA.md "Data reset"), then
+  // clears all local sync state (watermark + route-upload dedup) so the next
+  // Sync re-uploads the full first-sync window and every route from scratch.
+  // Local state is only cleared after the server wipe succeeds, so a failed
+  // wipe can simply be retried.
   Future<void> _resetSyncWatermark() async {
-    final prefs = await SharedPreferences.getInstance();
-    final t = DateTime.now().subtract(const Duration(hours: 24));
-    await prefs.setString(_lastSyncPrefsKey, t.toUtc().toIso8601String());
-    await prefs.remove(_uploadedRoutesPrefsKey); // re-send saved routes too
-    await prefs.remove(_uploadedHcRoutesPrefsKey); // and Health Connect routes
-    if (!mounted) return;
-    setState(() => _status =
-        'Reset: health watermark −24h and route-upload tracking cleared. '
-        'Next Sync re-uploads the last day + all saved routes.');
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Wipe server data?'),
+        content: Text(
+            'This deletes ALL data uploaded for your account on the server '
+            'and resets local sync state. The next Sync re-uploads the full '
+            '${_firstSyncWindow.inDays}-day window and all saved routes.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+              foregroundColor: Theme.of(ctx).colorScheme.onError,
+            ),
+            child: const Text('Delete & Reset'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      _uploading = true;
+      _status = 'Deleting server data...';
+    });
+    try {
+      final resp = await http
+          .delete(
+            Uri.parse('$_serverBase/me/data'),
+            headers: _auth.authHeaders,
+          )
+          .timeout(const Duration(seconds: 60));
+      if (!mounted) return;
+      if (resp.statusCode == 401) {
+        await _auth.invalidate();
+        if (!mounted) return;
+        setState(() {
+          _uploading = false;
+          _status = 'Sign-in expired. Please sign in again, then retry.';
+        });
+        return;
+      }
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        final body = resp.body.length > 300
+            ? '${resp.body.substring(0, 300)}…'
+            : resp.body;
+        setState(() {
+          _uploading = false;
+          _status = 'Server delete failed: ${resp.statusCode}. '
+              'Local sync state left untouched.\n$body';
+        });
+        return;
+      }
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_lastSyncPrefsKey);
+      await prefs.remove(_uploadedRoutesPrefsKey);
+      await prefs.remove(_uploadedHcRoutesPrefsKey);
+      if (!mounted) return;
+      setState(() {
+        _uploading = false;
+        _status = 'Server data deleted: ${resp.body}\nLocal sync state '
+            'cleared — next Sync re-uploads the full '
+            '${_firstSyncWindow.inDays}-day window + all routes.';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _uploading = false;
+        _status =
+            'Server delete failed: $e\nLocal sync state left untouched.';
+      });
+    }
   }
 
   Future<void> _readHeartRate() async {
@@ -2583,8 +2675,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 ),
               ),
             ),
-          // Independent of health permissions — just rewinds the sync watermark.
-          debugButton(Icons.history, 'Reset Sync (-24h + routes)',
+          // Independent of health permissions — wipes server data + sync state.
+          debugButton(Icons.restart_alt, 'Reset (wipe server + start over)',
               _resetSyncWatermark),
           const SizedBox(height: 8),
           debugButton(Icons.route, 'Grant HC Route Access',
