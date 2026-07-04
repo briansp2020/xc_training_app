@@ -65,6 +65,13 @@ const String _uploadedRoutesPrefsKey = 'uploaded_route_files';
 // uploaded to the server, so Sync only sends new ones.
 const String _uploadedHcRoutesPrefsKey = 'uploaded_hc_routes';
 
+// shared_preferences keys — onboarding state. route_access_done marks the
+// route-consent step completed (granted or explicitly skipped); auto_sync
+// stores the user's automatic-upload choice (absence = not asked yet, which
+// keeps them in onboarding).
+const String _routeAccessDonePrefsKey = 'route_access_done';
+const String _autoSyncPrefsKey = 'auto_sync_enabled';
+
 // Re-query an overlap behind the watermark on every incremental sync, to catch
 // late-arriving Health Connect samples. The watermark is a single global max
 // across all streams, so live HR pins it near "now"; but Fitbit derives resting
@@ -131,13 +138,13 @@ class _TrackPoint {
   });
 
   Map<String, dynamic> toJson() => {
-        'lat': lat,
-        'lng': lng,
-        'time': time.toUtc().toIso8601String(),
-        'accuracy_m': accuracy,
-        'altitude_m': altitude,
-        'speed_mps': speed,
-      };
+    'lat': lat,
+    'lng': lng,
+    'time': time.toUtc().toIso8601String(),
+    'accuracy_m': accuracy,
+    'altitude_m': altitude,
+    'speed_mps': speed,
+  };
 }
 
 // Summary of a saved run, parsed from a track JSON file for the Runs list.
@@ -155,6 +162,62 @@ class _RunSummary {
     required this.duration,
     required this.pointCount,
   });
+}
+
+// One logical run assembled from Health Connect workouts. Multiple apps often
+// write the SAME physical run (e.g. Fitbit records it with a route but types
+// it OTHER; Strava imports it typed RUNNING but without a route), so workouts
+// whose time windows overlap are grouped into one run for display.
+class _HcRun {
+  final List<HealthDataPoint> members = [];
+  DateTime start;
+  DateTime end;
+
+  _HcRun(HealthDataPoint first) : start = first.dateFrom, end = first.dateTo {
+    members.add(first);
+  }
+
+  void add(HealthDataPoint w) {
+    members.add(w);
+    if (w.dateFrom.isBefore(start)) start = w.dateFrom;
+    if (w.dateTo.isAfter(end)) end = w.dateTo;
+  }
+
+  bool overlaps(HealthDataPoint w) =>
+      w.dateFrom.isBefore(end) && w.dateTo.isAfter(start);
+
+  Set<String> get uuids => {for (final m in members) m.uuid};
+
+  Duration get duration => end.difference(start);
+
+  // Best label across the group: any specific type beats OTHER.
+  String get activityType {
+    for (final m in members) {
+      final v = m.value;
+      if (v is WorkoutHealthValue && v.workoutActivityType.name != 'OTHER') {
+        return v.workoutActivityType.name;
+      }
+    }
+    return 'OTHER';
+  }
+
+  double? get distanceMeters {
+    double? best;
+    for (final m in members) {
+      final v = m.value;
+      final d = v is WorkoutHealthValue ? v.totalDistance?.toDouble() : null;
+      if (d != null && (best == null || d > best)) best = d;
+    }
+    return best;
+  }
+
+  List<String> get sources {
+    final seen = <String>{};
+    return [
+      for (final m in members)
+        if (seen.add(m.sourceName)) m.sourceName,
+    ];
+  }
 }
 
 // Read-only map view of one saved run: its path, with start/end markers,
@@ -199,8 +262,7 @@ class _RunMapPage extends StatelessWidget {
               ),
               children: [
                 TileLayer(
-                  urlTemplate:
-                      'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                   userAgentPackageName: 'com.github.briansp2020.xctraining',
                 ),
                 PolylineLayer(
@@ -234,12 +296,12 @@ class _RunMapPage extends StatelessWidget {
   }
 
   static Widget _dot(Color c) => Container(
-        decoration: BoxDecoration(
-          color: c,
-          shape: BoxShape.circle,
-          border: Border.all(color: Colors.white, width: 2),
-        ),
-      );
+    decoration: BoxDecoration(
+      color: c,
+      shape: BoxShape.circle,
+      border: Border.all(color: Colors.white, width: 2),
+    ),
+  );
 }
 
 // A compass needle (red = north, grey = south) that counter-rotates with the
@@ -291,9 +353,11 @@ class XCTrainingApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'XC Training Data',
+      title: 'Chadwick XC Training',
       theme: ThemeData(
-        colorSchemeSeed: Colors.green,
+        // Seeded from the team logo's sky blue (same value as the adaptive
+        // launcher-icon background in pubspec.yaml).
+        colorSchemeSeed: const Color(0xFF81C6F0),
         useMaterial3: true,
       ),
       home: const HomeScreen(),
@@ -311,8 +375,9 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // Native bridge for Health Connect's route-consent dialogs (MainActivity.kt).
   // The health plugin can't request route access — see _grantRouteAccess.
-  static const MethodChannel _routeAccess =
-      MethodChannel('xctraining/route_access');
+  static const MethodChannel _routeAccess = MethodChannel(
+    'xctraining/route_access',
+  );
 
   final Health _health = Health();
   final AuthService _auth = AuthService(
@@ -325,8 +390,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _permissionsGranted = false;
   bool _uploading = false;
   bool _authLoading = true;
-  String? _heartRateValue;
-  String? _heartRateTime;
+  // Last sign-in failure, shown on the welcome screen (which doesn't display
+  // the general _status text).
+  String? _signInError;
+
+  // Onboarding state, persisted in prefs. Onboarding is complete when health
+  // permissions are granted, the route-access step is done (or skipped), and
+  // the user has made an automatic-upload choice.
+  bool _routeAccessDone = false;
+  bool? _autoSyncEnabled; // null = not asked yet
+  bool get _onboarded =>
+      _permissionsGranted && _routeAccessDone && _autoSyncEnabled != null;
+
+  // Home-page upload status: samples in the core streams newer than the sync
+  // watermark. null = check in progress; -1 = never synced.
+  int? _pendingSamples;
+  DateTime? _lastSyncAt;
 
   // DIY GPS route recording (foreground only for now). _track accumulates fixes
   // while _recording; _distanceMeters is summed incrementally between fixes.
@@ -362,13 +441,21 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<LatLng> _smoothedTrack = const [];
   int _smoothedAtLength = -1;
 
-  // Cached future for the Runs tab — refreshed when the tab is opened so a
-  // just-saved run shows up, without re-reading the dir on every rebuild.
+  // Cached future for the debug local-recordings list — refreshed when opened
+  // so a just-saved run shows up, without re-reading the dir on every rebuild.
   Future<List<_RunSummary>>? _runsFuture;
 
-  // Bottom-nav page index. Page 0 = Home (production UI), page 1 = Debug
-  // tools. The Debug page + its nav tab exist only in debug builds.
+  // Cached future for the Runs tab: workouts other apps wrote to Health
+  // Connect, grouped into logical runs. Refreshed when the tab is opened.
+  Future<List<_HcRun>>? _hcRunsFuture;
+
+  // Bottom-nav page index. Release: 0 = Home, 1 = Runs. Debug builds add
+  // 2 = Record and 3 = Debug tools.
   int _pageIndex = 0;
+
+  // The Record tab's nav index (debug builds only — release has no Record
+  // tab, so the preview-stream logic tied to this index never fires there).
+  static const int _recordTabIndex = 2;
 
   // Single source of truth for what the sync reads + what we request permission
   // for. Must match the manifest's READ_* declarations and the union of
@@ -419,10 +506,78 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<void> _bootstrap() async {
     await _auth.load();
     if (!mounted) return;
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     setState(() {
       _authLoading = false;
+      _routeAccessDone = prefs.getBool(_routeAccessDonePrefsKey) ?? false;
+      _autoSyncEnabled = prefs.containsKey(_autoSyncPrefsKey)
+          ? prefs.getBool(_autoSyncPrefsKey)
+          : null;
     });
     await _configureHealth();
+    if (!mounted) return;
+    if (_auth.isSignedIn) _afterSignedIn();
+  }
+
+  // Post-sign-in kick-off, shared by app start and the sign-in buttons: if
+  // the user is fully onboarded, either auto-upload (their choice) or just
+  // refresh the "anything new to upload?" home status.
+  void _afterSignedIn() {
+    if (!_onboarded) return; // onboarding UI takes over
+    if (_autoSyncEnabled == true && !_uploading) {
+      _syncHealthData(); // calls _refreshPendingData when done
+    } else {
+      _refreshPendingData();
+    }
+  }
+
+  // Recomputes the home page's upload status: how many samples in the core
+  // streams are newer than the sync watermark. HR trickles in continuously,
+  // so any nonzero count shows the Sync button.
+  Future<void> _refreshPendingData() async {
+    if (!_onboarded || !_auth.isSignedIn) return;
+    setState(() => _pendingSamples = null); // check in progress
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    final lastIso = prefs.getString(_lastSyncPrefsKey);
+    if (lastIso == null) {
+      setState(() {
+        _pendingSamples = -1; // never synced
+        _lastSyncAt = null;
+      });
+      return;
+    }
+    final last = DateTime.parse(lastIso);
+    final now = DateTime.now();
+    var count = 0;
+    for (final t in [
+      HealthDataType.WORKOUT,
+      HealthDataType.HEART_RATE,
+      HealthDataType.STEPS,
+    ]) {
+      count += (await _safeRead(t, last, now)).length;
+      if (!mounted) return;
+    }
+    setState(() {
+      _pendingSamples = count;
+      _lastSyncAt = last.toLocal();
+    });
+  }
+
+  // Records the user's automatic-upload choice (the final onboarding step,
+  // also togglable from the home page).
+  Future<void> _setAutoSync(bool enabled) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_autoSyncPrefsKey, enabled);
+    if (!mounted) return;
+    final firstDecision = _autoSyncEnabled == null;
+    setState(() => _autoSyncEnabled = enabled);
+    if (firstDecision && enabled && !_uploading) {
+      _syncHealthData(); // onboarding just finished — start the first upload
+    } else {
+      _refreshPendingData();
+    }
   }
 
   @override
@@ -443,7 +598,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (_recording) return;
     if (state == AppLifecycleState.resumed) {
-      if (_pageIndex == 1) _startLocationPreview();
+      if (_pageIndex == _recordTabIndex) _startLocationPreview();
     } else if (state == AppLifecycleState.paused) {
       _stopLocationPreview();
     }
@@ -455,7 +610,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // Background ("Allow all the time") is a later milestone.
   Future<bool> _ensureLocationPermission() async {
     if (!await Geolocator.isLocationServiceEnabled()) {
-      setState(() => _status = 'Location is off — enable GPS, then start the run.');
+      setState(
+        () => _status = 'Location is off — enable GPS, then start the run.',
+      );
       return false;
     }
     var perm = await Geolocator.checkPermission();
@@ -464,8 +621,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     if (perm == LocationPermission.denied ||
         perm == LocationPermission.deniedForever) {
-      setState(() => _status =
-          'Location permission denied. Grant it in Settings to record runs.');
+      setState(
+        () => _status =
+            'Location permission denied. Grant it in Settings to record runs.',
+      );
       return false;
     }
     return true;
@@ -488,7 +647,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         _distanceMeters = 0;
         _elapsed = Duration.zero;
         _recordStart = DateTime.now();
-        _status = 'Recording run — you can lock the screen; '
+        _status =
+            'Recording run — you can lock the screen; '
             'a notification keeps it tracking.';
       });
 
@@ -503,7 +663,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           notificationTitle: 'XC Training — recording run',
           notificationText: 'Tracking your GPS route',
           notificationChannelName: 'Run recording',
-          enableWakeLock: true, // keep the CPU awake for GPS while screen is off
+          enableWakeLock:
+              true, // keep the CPU awake for GPS while screen is off
           setOngoing: true, // can't be swiped away mid-run
         ),
       );
@@ -525,7 +686,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           if (_track.isNotEmpty) {
             final last = _track.last;
             leg = Geolocator.distanceBetween(
-                last.lat, last.lng, pos.latitude, pos.longitude);
+              last.lat,
+              last.lng,
+              pos.latitude,
+              pos.longitude,
+            );
             // Reject implausible jumps (GPS multipath spikes): a leg implying a
             // speed no runner can hit is a bad fix, not real distance.
             final dt =
@@ -534,14 +699,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           }
           setState(() {
             if (leg != null) _distanceMeters += leg;
-            _track.add(_TrackPoint(
-              lat: pos.latitude,
-              lng: pos.longitude,
-              time: pos.timestamp,
-              accuracy: pos.accuracy,
-              altitude: pos.altitude,
-              speed: pos.speed,
-            ));
+            _track.add(
+              _TrackPoint(
+                lat: pos.latitude,
+                lng: pos.longitude,
+                time: pos.timestamp,
+                accuracy: pos.accuracy,
+                altitude: pos.altitude,
+                speed: pos.speed,
+              ),
+            );
             _lastFix = fix;
           });
           _followCamera(fix); // keep the map centered on the runner
@@ -570,7 +737,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final points = _track.toList();
     if (!mounted) return;
     setState(() => _recording = false);
-    if (_pageIndex == 1) _startLocationPreview(); // resume idle preview
+    if (_pageIndex == _recordTabIndex) {
+      _startLocationPreview(); // resume idle preview
+    }
 
     if (points.isEmpty) {
       setState(() => _status = 'Stopped — no GPS fixes captured.');
@@ -596,13 +765,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
     try {
       final dir = await getApplicationDocumentsDirectory();
-      final stamp =
-          start.toUtc().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
+      final stamp = start.toUtc().toIso8601String().replaceAll(
+        RegExp(r'[:.]'),
+        '-',
+      );
       final file = File('${dir.path}/xc_route_$stamp.json');
       await file.writeAsString(jsonEncode(payload));
       if (!mounted) return;
       setState(() {
-        _status = 'Saved run: ${(_distanceMeters / 1000).toStringAsFixed(2)} km, '
+        _status =
+            'Saved run: ${(_distanceMeters / 1000).toStringAsFixed(2)} km, '
             '${_fmtDuration(duration)}, ${points.length} points\n→ ${file.path}';
         // The run is saved (from the points snapshot above) — clear the live
         // track so its polyline doesn't linger on the idle preview map. Keep
@@ -646,7 +818,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _lastFix!.longitude,
     );
     if (offBy > 25) {
-      _mapController.move(_lastFix!, _recordMapZoom); // recenter at default zoom
+      _mapController.move(
+        _lastFix!,
+        _recordMapZoom,
+      ); // recenter at default zoom
       setState(() => _mapCentered = true);
     } else {
       _mapController.rotate(0); // already centered → align north-up
@@ -664,33 +839,37 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     if (_recording || _previewSub != null) return;
     if (!await _ensureLocationPermission()) return;
     // State may have changed during the permission await.
-    if (!mounted || _recording || _previewSub != null || _pageIndex != 1) {
+    if (!mounted ||
+        _recording ||
+        _previewSub != null ||
+        _pageIndex != _recordTabIndex) {
       return;
     }
-    _previewSub = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 10,
-      ),
-    ).listen(
-      (pos) {
-        if (!mounted) return;
-        final fix = LatLng(pos.latitude, pos.longitude);
-        setState(() {
-          _lastFix = fix;
-          _gpsError = null; // a fix arrived — clear any prior preview error
-        });
-        // Follow only if centered, so panning the idle map isn't yanked back.
-        if (_mapCentered) _followCamera(fix);
-      },
-      // Don't swallow it: surface in the Record banner (and the dev console) so
-      // a broken preview doesn't sit on "Locating you…" forever.
-      onError: (e) {
-        debugPrint('[preview] GPS error: $e');
-        if (!mounted) return;
-        setState(() => _gpsError = 'GPS unavailable: $e');
-      },
-    );
+    _previewSub =
+        Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            distanceFilter: 10,
+          ),
+        ).listen(
+          (pos) {
+            if (!mounted) return;
+            final fix = LatLng(pos.latitude, pos.longitude);
+            setState(() {
+              _lastFix = fix;
+              _gpsError = null; // a fix arrived — clear any prior preview error
+            });
+            // Follow only if centered, so panning the idle map isn't yanked back.
+            if (_mapCentered) _followCamera(fix);
+          },
+          // Don't swallow it: surface in the Record banner (and the dev console) so
+          // a broken preview doesn't sit on "Locating you…" forever.
+          onError: (e) {
+            debugPrint('[preview] GPS error: $e');
+            if (!mounted) return;
+            setState(() => _gpsError = 'GPS unavailable: $e');
+          },
+        );
   }
 
   void _stopLocationPreview() {
@@ -699,12 +878,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _signInWithGoogle() async {
-    setState(() => _status = 'Signing in with Google...');
+    setState(() {
+      _status = 'Signing in with Google...';
+      _signInError = null;
+    });
     final err = await _auth.signInWithGoogle();
     if (!mounted) return;
     setState(() {
-      _status = err ?? 'Signed in as ${_auth.email ?? _auth.name ?? "(unknown)"}.';
+      _signInError = err;
+      _status =
+          err ?? 'Signed in as ${_auth.email ?? _auth.name ?? "(unknown)"}.';
     });
+    if (err == null) _afterSignedIn();
   }
 
   Future<void> _signInWithDevEmail() async {
@@ -719,8 +904,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              const Text('Email to sign in as. The server must be running '
-                  'with DEV_MODE=true for this to work.'),
+              const Text(
+                'Email to sign in as. The server must be running '
+                'with DEV_MODE=true for this to work.',
+              ),
               const SizedBox(height: 12),
               TextField(
                 controller: controller,
@@ -750,12 +937,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
     if (email == null || email.trim().isEmpty) return;
     if (!mounted) return;
-    setState(() => _status = 'Signing in as $email...');
+    setState(() {
+      _status = 'Signing in as $email...';
+      _signInError = null;
+    });
     final err = await _auth.signInWithDevEmail(email);
     if (!mounted) return;
     setState(() {
+      _signInError = err;
       _status = err ?? 'Signed in as ${_auth.email ?? email}.';
     });
+    if (err == null) _afterSignedIn();
   }
 
   Future<void> _signOut() async {
@@ -794,8 +986,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           padding: const EdgeInsets.fromLTRB(16, 8, 8, 8),
           child: Row(
             children: [
-              Icon(Icons.account_circle,
-                  color: theme.colorScheme.onSecondaryContainer),
+              Icon(
+                Icons.account_circle,
+                color: theme.colorScheme.onSecondaryContainer,
+              ),
               const SizedBox(width: 12),
               Expanded(
                 child: Text(
@@ -807,10 +1001,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
-              TextButton(
-                onPressed: _signOut,
-                child: const Text('Sign out'),
-              ),
+              TextButton(onPressed: _signOut, child: const Text('Sign out')),
             ],
           ),
         ),
@@ -832,12 +1023,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ),
             const SizedBox(height: 12),
             FilledButton.icon(
-              onPressed:
-                  _auth.isGoogleConfigured ? _signInWithGoogle : null,
+              onPressed: _auth.isGoogleConfigured ? _signInWithGoogle : null,
               icon: const Icon(Icons.login),
-              label: Text(_auth.isGoogleConfigured
-                  ? 'Sign in with Google'
-                  : 'Google Sign-In not configured'),
+              label: Text(
+                _auth.isGoogleConfigured
+                    ? 'Sign in with Google'
+                    : 'Google Sign-In not configured',
+              ),
             ),
             const SizedBox(height: 8),
             OutlinedButton.icon(
@@ -992,7 +1184,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       workouts.sort((a, b) => b.dateFrom.compareTo(a.dateFrom));
       final recent = workouts.take(5).toList();
       debugPrint(
-          '[DISCOVERY] Found ${workouts.length} workouts; inspecting ${recent.length} most recent.');
+        '[DISCOVERY] Found ${workouts.length} workouts; inspecting ${recent.length} most recent.',
+      );
 
       for (var i = 0; i < recent.length; i++) {
         final w = recent[i];
@@ -1009,7 +1202,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         }
 
         debugPrint(
-            '\nProbing related data types in window [${w.dateFrom.toIso8601String()} .. ${w.dateTo.toIso8601String()}]:');
+          '\nProbing related data types in window [${w.dateFrom.toIso8601String()} .. ${w.dateTo.toIso8601String()}]:',
+        );
 
         for (final t in probeTypes) {
           try {
@@ -1019,7 +1213,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               endTime: w.dateTo,
             );
             if (samples.isEmpty) {
-              debugPrint('  ${t.name}: 0 samples (no data, or permission missing)');
+              debugPrint(
+                '  ${t.name}: 0 samples (no data, or permission missing)',
+              );
               continue;
             }
             debugPrint('  ${t.name}: ${samples.length} sample(s)');
@@ -1035,7 +1231,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             }
             if (samples.length > 1) {
               debugPrint(
-                  '    ...${samples.length - 1} additional sample(s) elided');
+                '    ...${samples.length - 1} additional sample(s) elided',
+              );
             }
           } catch (e) {
             debugPrint('  ${t.name}: ERROR ($e)');
@@ -1120,7 +1317,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       debugPrint('\n$bar');
       debugPrint(
-          '[ALL DATA] 30-day window: ${thirtyDaysAgo.toIso8601String()} -> ${now.toIso8601String()}');
+        '[ALL DATA] 30-day window: ${thirtyDaysAgo.toIso8601String()} -> ${now.toIso8601String()}',
+      );
       debugPrint(bar);
 
       final results = <HealthDataType, List<HealthDataPoint>>{};
@@ -1140,14 +1338,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             ? '-'
             : sourceCounts.entries.map((e) => '${e.key}=${e.value}').join(', ');
         debugPrint(
-            '${entry.key.name.padRight(36)} ${samples.length.toString().padLeft(5)}   $sourceStr');
+          '${entry.key.name.padRight(36)} ${samples.length.toString().padLeft(5)}   $sourceStr',
+        );
       }
 
       debugPrint('\n\nFirst sample of each non-empty type:');
       for (final entry in results.entries) {
         if (entry.value.isEmpty) continue;
         debugPrint(
-            '\n--- ${entry.key.name} (${entry.value.length} samples) ---');
+          '\n--- ${entry.key.name} (${entry.value.length} samples) ---',
+        );
         try {
           debugPrint(indent.convert(entry.value.first.toJson()));
         } catch (e) {
@@ -1165,8 +1365,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         final scored = <MapEntry<double, HealthDataPoint>>[];
         for (final s in steps) {
           final v = s.value;
-          final count =
-              v is NumericHealthValue ? v.numericValue.toDouble() : 0.0;
+          final count = v is NumericHealthValue
+              ? v.numericValue.toDouble()
+              : 0.0;
           final seconds = s.dateTo.difference(s.dateFrom).inSeconds;
           final rate = seconds > 0 ? count / (seconds / 60.0) : count;
           scored.add(MapEntry(rate, s));
@@ -1178,8 +1379,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           final count = v is NumericHealthValue ? v.numericValue : 0;
           final dur = s.dateTo.difference(s.dateFrom);
           debugPrint(
-              '  ${s.dateFrom.toLocal()}  +${dur.inSeconds}s: $count steps '
-              '(${entry.key.toStringAsFixed(1)} spm)  ${s.sourceName}');
+            '  ${s.dateFrom.toLocal()}  +${dur.inSeconds}s: $count steps '
+            '(${entry.key.toStringAsFixed(1)} spm)  ${s.sourceName}',
+          );
         }
       }
 
@@ -1241,8 +1443,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final now = DateTime.now();
       final windowStart = now.subtract(_firstSyncWindow);
 
-      final built =
-          await _buildSyncPayload(windowStart, now, labelSuffix: ' (export)');
+      final built = await _buildSyncPayload(
+        windowStart,
+        now,
+        labelSuffix: ' (export)',
+      );
       if (!mounted) return;
       final payload = built.payload;
       final workoutCount = (payload['workouts'] as List).length;
@@ -1260,7 +1465,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final sizeMB = (await file.length() / 1024 / 1024).toStringAsFixed(2);
       setState(() {
         _uploading = false;
-        _status = 'Exported $sizeMB MB '
+        _status =
+            'Exported $sizeMB MB '
             '($workoutCount workouts, ${built.totalSamples} samples) to:\n'
             '${file.path}';
       });
@@ -1305,7 +1511,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         if (!mounted) return;
         setState(() {
           _uploading = false;
-          _status = 'No import file at:\n${file.path}\n\n'
+          _status =
+              'No import file at:\n${file.path}\n\n'
               'Push one via adb:\n'
               'adb push health_export.json ${file.path}';
         });
@@ -1330,14 +1537,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _status = 'Requesting WRITE permissions...');
       final writeOk = await _health.requestAuthorization(
         writeTypes,
-        permissions:
-            writeTypes.map((_) => HealthDataAccess.WRITE).toList(),
+        permissions: writeTypes.map((_) => HealthDataAccess.WRITE).toList(),
       );
       if (!mounted) return;
       if (!writeOk) {
         setState(() {
           _uploading = false;
-          _status = 'WRITE permission denied. Grant in Health Connect and retry.';
+          _status =
+              'WRITE permission denied. Grant in Health Connect and retry.';
         });
         return;
       }
@@ -1348,8 +1555,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       int workoutsOk = 0;
       for (var i = 0; i < workouts.length; i++) {
         final w = workouts[i];
-        setState(() => _status =
-            'Importing workout ${i + 1}/${workouts.length}...');
+        setState(
+          () => _status = 'Importing workout ${i + 1}/${workouts.length}...',
+        );
         try {
           final ok = await _health.writeWorkoutData(
             activityType: _parseWorkoutActivity(w['activity_type'] as String?),
@@ -1375,15 +1583,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       int numericOk = 0;
       int numericTotal = 0;
       for (final entry in numericWritable.entries) {
-        final samples = (payload[entry.key] as List?)
-                ?.cast<Map<String, dynamic>>() ??
-            [];
+        final samples =
+            (payload[entry.key] as List?)?.cast<Map<String, dynamic>>() ?? [];
         numericTotal += samples.length;
         for (var i = 0; i < samples.length; i++) {
           if (i % 200 == 0) {
             if (!mounted) return;
-            setState(() => _status =
-                'Importing ${entry.key} ${i + 1}/${samples.length}...');
+            setState(
+              () => _status =
+                  'Importing ${entry.key} ${i + 1}/${samples.length}...',
+            );
           }
           final s = samples[i];
           try {
@@ -1410,15 +1619,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       int intervalOk = 0;
       int intervalTotal = 0;
       for (final entry in intervalWritable.entries) {
-        final samples = (payload[entry.key] as List?)
-                ?.cast<Map<String, dynamic>>() ??
-            [];
+        final samples =
+            (payload[entry.key] as List?)?.cast<Map<String, dynamic>>() ?? [];
         intervalTotal += samples.length;
         for (var i = 0; i < samples.length; i++) {
           if (i % 100 == 0) {
             if (!mounted) return;
-            setState(() => _status =
-                'Importing ${entry.key} ${i + 1}/${samples.length}...');
+            setState(
+              () => _status =
+                  'Importing ${entry.key} ${i + 1}/${samples.length}...',
+            );
           }
           final s = samples[i];
           try {
@@ -1457,7 +1667,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() {
         _uploading = false;
-        _status = 'Import complete:\n'
+        _status =
+            'Import complete:\n'
             '  workouts: $workoutsOk/${workouts.length}\n'
             '  HR: $numericOk/$numericTotal\n'
             '  intervals: $intervalOk/$intervalTotal\n'
@@ -1501,8 +1712,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     try {
       final ok = await _health.requestAuthorization(
         _writeTypes,
-        permissions:
-            _writeTypes.map((_) => HealthDataAccess.WRITE).toList(),
+        permissions: _writeTypes.map((_) => HealthDataAccess.WRITE).toList(),
       );
       if (!mounted) return;
       setState(() {
@@ -1551,7 +1761,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   static const Duration _readChunk = Duration(days: 3);
 
   Future<List<HealthDataPoint>> _safeRead(
-      HealthDataType t, DateTime start, DateTime end) async {
+    HealthDataType t,
+    DateTime start,
+    DateTime end,
+  ) async {
     final out = <HealthDataPoint>[];
     // Records overlapping a slice boundary are returned by both slices —
     // dedup by uuid so callers see each record once.
@@ -1572,8 +1785,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       } catch (e, st) {
         // Don't crash the caller — expected for unpermissioned types — but
         // log so it's still visible in the dev console.
-        debugPrint(
-            '[_safeRead] ${t.name} $cursor..$sliceEnd failed: $e\n$st');
+        debugPrint('[_safeRead] ${t.name} $cursor..$sliceEnd failed: $e\n$st');
       }
       cursor = sliceEnd;
     }
@@ -1615,9 +1827,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   /// getHealthDataFromTypes call makes the health plugin serialize the whole
   /// result across the method channel in one allocation, and a full window of
   /// ~165k HR samples OOMs the Java heap.
-  Future<({Map<String, dynamic> payload, int totalSamples, DateTime? maxSampleTime})>
-      _buildSyncPayload(DateTime windowStart, DateTime now,
-          {String labelSuffix = ''}) async {
+  Future<
+    ({Map<String, dynamic> payload, int totalSamples, DateTime? maxSampleTime})
+  >
+  _buildSyncPayload(
+    DateTime windowStart,
+    DateTime now, {
+    String labelSuffix = '',
+  }) async {
     // Newest dateTo across everything we read — becomes the sync watermark.
     DateTime? maxSampleTime;
     void trackMax(DateTime t) {
@@ -1634,8 +1851,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
 
     final workoutPayloads = workouts.map((w) {
-      final wv =
-          w.value is WorkoutHealthValue ? w.value as WorkoutHealthValue : null;
+      final wv = w.value is WorkoutHealthValue
+          ? w.value as WorkoutHealthValue
+          : null;
       return <String, dynamic>{
         'source_uuid': w.uuid,
         'source_app': w.sourceName,
@@ -1717,16 +1935,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
       final bodyBytes = utf8.encode(jsonEncode(payload));
       final sizeMB = (bodyBytes.length / 1024 / 1024).toStringAsFixed(2);
-      setState(() => _status =
-          'Uploading $workoutCount workouts + $totalSamples samples ($sizeMB MB)...');
+      setState(
+        () => _status =
+            'Uploading $workoutCount workouts + $totalSamples samples ($sizeMB MB)...',
+      );
 
       final response = await http
           .post(
             Uri.parse('$_serverBase/workouts'),
-            headers: {
-              'Content-Type': 'application/json',
-              ..._auth.authHeaders,
-            },
+            headers: {'Content-Type': 'application/json', ..._auth.authHeaders},
             body: bodyBytes,
           )
           .timeout(const Duration(seconds: 120));
@@ -1739,7 +1956,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         // watermark alone so the next sync re-queries the same window —
         // that way delayed Health Connect inserts can still be picked up.
         await prefs.setString(
-            _lastSyncPrefsKey, maxSampleTime.toUtc().toIso8601String());
+          _lastSyncPrefsKey,
+          maxSampleTime.toUtc().toIso8601String(),
+        );
         if (!mounted) return;
       }
 
@@ -1750,8 +1969,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         if (!mounted) return;
         setState(() {
           _uploading = false;
-          _status =
-              'Sign-in expired. Please sign in again, then re-tap Sync.';
+          _status = 'Sign-in expired. Please sign in again, then re-tap Sync.';
         });
         return;
       }
@@ -1774,8 +1992,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       // ...and any GPS routes other apps attached to their workouts in
       // Health Connect (Fitbit / Pixel Watch runs).
       setState(() => _status = 'Uploading Health Connect routes...');
-      final hcRoutes =
-          await _uploadHealthConnectRoutes(prefs, windowStart, now);
+      final hcRoutes = await _uploadHealthConnectRoutes(
+        prefs,
+        windowStart,
+        now,
+      );
       if (!mounted) return;
       if (hcRoutes.unauthorized) {
         await _auth.invalidate();
@@ -1792,12 +2013,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final routeMsg = (routesUploaded == 0 && routesFailed == 0)
           ? ' No new routes.'
           : ' Routes: $routesUploaded uploaded'
-              '${hcRoutes.uploaded > 0 ? " (${hcRoutes.uploaded} from Health Connect)" : ""}'
-              '${routesFailed > 0 ? ", $routesFailed failed" : ""}.';
+                '${hcRoutes.uploaded > 0 ? " (${hcRoutes.uploaded} from Health Connect)" : ""}'
+                '${routesFailed > 0 ? ", $routesFailed failed" : ""}.';
       final consentMsg = hcRoutes.pendingConsent > 0
           ? '\n${hcRoutes.pendingConsent} Health Connect route(s) unreadable — '
-              'grant "Exercise routes → Always allow" in Health Connect → '
-              'App permissions → XC Training Data, then Sync again.'
+                'grant "Exercise routes → Always allow" in Health Connect → '
+                'App permissions → XC Training Data, then Sync again.'
           : '';
       setState(() {
         _uploading = false;
@@ -1809,12 +2030,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               'Health upload failed: ${response.statusCode}.$routeMsg$consentMsg\n${response.body}';
         }
       });
+      _refreshPendingData(); // recompute the home page's upload status
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _uploading = false;
         _status = 'Sync error: $e';
       });
+      _refreshPendingData();
     }
   }
 
@@ -1822,10 +2045,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // tracking which filenames are done in shared_preferences. Files stay on
   // device (so the Runs tab keeps them); failures are retried next sync.
   Future<({int uploaded, int failed, bool unauthorized})> _uploadRouteTracks(
-      SharedPreferences prefs) async {
+    SharedPreferences prefs,
+  ) async {
     final dir = await getApplicationDocumentsDirectory();
-    final files = dir.listSync().whereType<File>().where((f) =>
-        f.path.endsWith('.json') && f.path.contains('xc_route_'));
+    final files = dir.listSync().whereType<File>().where(
+      (f) => f.path.endsWith('.json') && f.path.contains('xc_route_'),
+    );
     final done = (prefs.getStringList(_uploadedRoutesPrefsKey) ?? []).toSet();
     var uploaded = 0;
     var failed = 0;
@@ -1852,7 +2077,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           done.add(name);
           uploaded++;
         } else {
-          debugPrint('[routes] $name rejected: ${resp.statusCode} ${resp.body}');
+          debugPrint(
+            '[routes] $name rejected: ${resp.statusCode} ${resp.body}',
+          );
           failed++;
         }
       } catch (e) {
@@ -1870,10 +2097,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   // (ConsentRequired) — counted in pendingConsent so the status can tell the
   // user to grant "Exercise routes" in Health Connect's app permissions.
   Future<({int uploaded, int failed, int pendingConsent, bool unauthorized})>
-      _uploadHealthConnectRoutes(
-          SharedPreferences prefs, DateTime windowStart, DateTime now) async {
-    final points =
-        await _safeRead(HealthDataType.WORKOUT_ROUTE, windowStart, now);
+  _uploadHealthConnectRoutes(
+    SharedPreferences prefs,
+    DateTime windowStart,
+    DateTime now,
+  ) async {
+    final points = await _safeRead(
+      HealthDataType.WORKOUT_ROUTE,
+      windowStart,
+      now,
+    );
     final done = (prefs.getStringList(_uploadedHcRoutesPrefsKey) ?? []).toSet();
     var uploaded = 0;
     var failed = 0;
@@ -1894,10 +2127,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       var dist = 0.0;
       for (var i = 1; i < locs.length; i++) {
         dist += Geolocator.distanceBetween(
-            locs[i - 1].latitude,
-            locs[i - 1].longitude,
-            locs[i].latitude,
-            locs[i].longitude);
+          locs[i - 1].latitude,
+          locs[i - 1].longitude,
+          locs[i].latitude,
+          locs[i].longitude,
+        );
       }
       final payload = {
         'type': 'route_track',
@@ -1919,7 +2153,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               'accuracy_m': p.horizontalAccuracy,
               'altitude_m': p.altitude,
               'speed_mps': p.speed, // null on Android — HC routes omit speed
-            }
+            },
         ],
       };
       try {
@@ -1947,7 +2181,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           uploaded++;
         } else {
           debugPrint(
-              '[hc-routes] $id rejected: ${resp.statusCode} ${resp.body}');
+            '[hc-routes] $id rejected: ${resp.statusCode} ${resp.body}',
+          );
           failed++;
         }
       } catch (e) {
@@ -1964,25 +2199,38 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  // Debug: obtain Health Connect route access via the native dialogs. Tries
-  // the blanket "Exercise routes" permission first (Android 15+); if that's
-  // unavailable or denied, falls back to the per-route consent dialog for the
-  // first consent-blocked route (its "Allow all" option covers future runs).
+  // Marks the route-access onboarding step complete (granted or skipped).
+  Future<void> _markRouteAccessDone() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_routeAccessDonePrefsKey, true);
+    if (!mounted) return;
+    setState(() => _routeAccessDone = true);
+  }
+
+  // Obtains Health Connect route access via the native dialogs (used by
+  // onboarding and the debug page). Tries the blanket "Exercise routes"
+  // permission first (Android 15+); if that's unavailable or denied, falls
+  // back to the per-route consent dialog for the first consent-blocked route
+  // (its "Allow all" option covers future runs).
   Future<void> _grantRouteAccess() async {
     setState(() => _status = 'Requesting Health Connect route access...');
     try {
-      final blanket =
-          await _routeAccess.invokeMethod<bool>('requestRoutesPermission');
+      final blanket = await _routeAccess.invokeMethod<bool>(
+        'requestRoutesPermission',
+      );
       if (!mounted) return;
       if (blanket == true) {
-        setState(() => _status =
-            'Exercise-routes permission granted. Tap Sync to upload routes.');
+        setState(() => _status = 'Exercise-routes permission granted.');
+        await _markRouteAccessDone();
         return;
       }
       // Fall back to per-route consent for the first blocked route.
       final now = DateTime.now();
-      final points = await _safeRead(HealthDataType.WORKOUT_ROUTE,
-          now.subtract(const Duration(days: 30)), now);
+      final points = await _safeRead(
+        HealthDataType.WORKOUT_ROUTE,
+        now.subtract(const Duration(days: 30)),
+        now,
+      );
       if (!mounted) return;
       String? uuid;
       for (final p in points) {
@@ -1993,17 +2241,25 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         }
       }
       if (uuid == null) {
-        setState(() => _status =
-            'No consent-blocked routes found in the last 30 days.');
+        // Nothing blocked on consent — nothing to grant right now.
+        setState(
+          () =>
+              _status = 'No consent-blocked routes found in the last 30 days.',
+        );
+        await _markRouteAccessDone();
         return;
       }
-      final ok = await _routeAccess
-          .invokeMethod<bool>('requestRouteConsent', {'sessionUuid': uuid});
+      final ok = await _routeAccess.invokeMethod<bool>('requestRouteConsent', {
+        'sessionUuid': uuid,
+      });
       if (!mounted) return;
-      setState(() => _status = ok == true
-          ? 'Route consent granted — pick "Allow all" next time to cover '
-              'future runs automatically. Tap Sync to upload.'
-          : 'Route consent denied.');
+      setState(
+        () => _status = ok == true
+            ? 'Route consent granted — pick "Allow all" next time to cover '
+                  'future runs automatically.'
+            : 'Route consent denied.',
+      );
+      if (ok == true) await _markRouteAccessDone();
     } catch (e) {
       if (!mounted) return;
       setState(() => _status = 'Route access request failed: $e');
@@ -2022,9 +2278,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       builder: (ctx) => AlertDialog(
         title: const Text('Wipe server data?'),
         content: Text(
-            'This deletes ALL data uploaded for your account on the server '
-            'and resets local sync state. The next Sync re-uploads the full '
-            '${_firstSyncWindow.inDays}-day window and all saved routes.'),
+          'This deletes ALL data uploaded for your account on the server '
+          'and resets local sync state. The next Sync re-uploads the full '
+          '${_firstSyncWindow.inDays}-day window and all saved routes.',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
@@ -2049,10 +2306,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     });
     try {
       final resp = await http
-          .delete(
-            Uri.parse('$_serverBase/me/data'),
-            headers: _auth.authHeaders,
-          )
+          .delete(Uri.parse('$_serverBase/me/data'), headers: _auth.authHeaders)
           .timeout(const Duration(seconds: 60));
       if (!mounted) return;
       if (resp.statusCode == 401) {
@@ -2070,7 +2324,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             : resp.body;
         setState(() {
           _uploading = false;
-          _status = 'Server delete failed: ${resp.statusCode}. '
+          _status =
+              'Server delete failed: ${resp.statusCode}. '
               'Local sync state left untouched.\n$body';
         });
         return;
@@ -2082,7 +2337,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() {
         _uploading = false;
-        _status = 'Server data deleted: ${resp.body}\nLocal sync state '
+        _status =
+            'Server data deleted: ${resp.body}\nLocal sync state '
             'cleared — next Sync re-uploads the full '
             '${_firstSyncWindow.inDays}-day window + all routes.';
       });
@@ -2090,8 +2346,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (!mounted) return;
       setState(() {
         _uploading = false;
-        _status =
-            'Server delete failed: $e\nLocal sync state left untouched.';
+        _status = 'Server delete failed: $e\nLocal sync state left untouched.';
       });
     }
   }
@@ -2113,8 +2368,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       if (data.isEmpty) {
         setState(() {
           _status = 'No heart rate data found in the last 24 hours.';
-          _heartRateValue = null;
-          _heartRateTime = null;
         });
         return;
       }
@@ -2125,17 +2378,15 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       final bpm = v is NumericHealthValue ? v.numericValue : v;
 
       setState(() {
-        _heartRateValue = '$bpm BPM';
-        _heartRateTime = latest.dateFrom.toLocal().toString().substring(0, 19);
         _status =
-            'Heart rate data loaded (${data.length} readings in last 24h).';
+            'Latest heart rate: $bpm BPM at '
+            '${latest.dateFrom.toLocal().toString().substring(0, 19)} '
+            '(${data.length} readings in last 24h).';
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _status = 'Error reading heart rate: $e';
-        _heartRateValue = null;
-        _heartRateTime = null;
       });
     }
   }
@@ -2144,78 +2395,325 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
 
-    // Tabs: Home, Record, Runs (always); Debug only in debug builds.
+    // Loading persisted session → blank spinner (avoids a sign-in flash).
+    if (_authLoading) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    // Signed out → welcome screen: logo, message, sign-in. Nothing else.
+    if (!_auth.isSignedIn) return _buildWelcome(theme);
+
+    // Signed in but not set up → guided onboarding (permissions, route
+    // access, automatic-upload choice).
+    if (!_onboarded) return _buildOnboarding(theme);
+
+    // The team doesn't record runs in-app, so release builds are Home + Runs
+    // (workouts other apps wrote to Health Connect). Record and Debug tabs
+    // exist only in debug builds, for development/testing.
+    if (!kDebugMode) {
+      final index = _pageIndex.clamp(0, 1);
+      return Scaffold(
+        appBar: AppBar(
+          title: Text(index == 1 ? 'My Runs' : 'Chadwick XC Training'),
+          centerTitle: true,
+        ),
+        body: index == 1 ? _buildHcRunsPage(theme) : _buildHomePage(theme),
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: index,
+          onDestinationSelected: (i) {
+            setState(() {
+              _pageIndex = i;
+              if (i == 1) _hcRunsFuture = _loadHcRuns(); // refresh on open
+            });
+          },
+          destinations: const [
+            NavigationDestination(
+              icon: Icon(Icons.home_outlined),
+              selectedIcon: Icon(Icons.home),
+              label: 'Home',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.directions_run_outlined),
+              selectedIcon: Icon(Icons.directions_run),
+              label: 'Runs',
+            ),
+          ],
+        ),
+      );
+    }
+
+    // Debug builds: Home + Runs + dev-only tabs.
     final titles = <String>[
-      'XC Training Data',
-      'Record Run',
+      'Chadwick XC Training',
       'My Runs',
-      if (kDebugMode) 'Debug Tools',
+      'Record Run',
+      'Debug Tools',
     ];
     final index = _pageIndex.clamp(0, titles.length - 1);
 
-    // Build only the active page. Building all of them every frame would re-run
-    // _buildRunsPage (which reads saved tracks from disk) on every setState —
-    // e.g. once per second while recording.
+    // Build only the active page — building all of them every frame would
+    // re-run the Runs loaders on every setState (e.g. once per second while
+    // recording).
     final Widget body;
     switch (index) {
       case 0:
         body = _buildHomePage(theme);
         break;
       case 1:
-        body = _buildRecordPage(theme);
+        body = _buildHcRunsPage(theme);
         break;
       case 2:
-        body = _buildRunsPage(theme);
+        body = _buildRecordPage(theme);
         break;
       default:
         body = _buildDebugPage(theme);
     }
 
-    final destinations = <NavigationDestination>[
-      const NavigationDestination(
-        icon: Icon(Icons.home_outlined),
-        selectedIcon: Icon(Icons.home),
-        label: 'Home',
-      ),
-      const NavigationDestination(
-        icon: Icon(Icons.fiber_manual_record_outlined),
-        selectedIcon: Icon(Icons.fiber_manual_record),
-        label: 'Record',
-      ),
-      const NavigationDestination(
-        icon: Icon(Icons.route_outlined),
-        selectedIcon: Icon(Icons.route),
-        label: 'Runs',
-      ),
-      if (kDebugMode)
-        const NavigationDestination(
-          icon: Icon(Icons.bug_report_outlined),
-          selectedIcon: Icon(Icons.bug_report),
-          label: 'Debug',
-        ),
-    ];
-
     return Scaffold(
-      appBar: AppBar(
-        title: Text(titles[index]),
-        centerTitle: true,
-      ),
+      appBar: AppBar(title: Text(titles[index]), centerTitle: true),
       body: body,
       bottomNavigationBar: NavigationBar(
         selectedIndex: index,
         onDestinationSelected: (i) {
           setState(() {
             _pageIndex = i;
-            if (i == 2) _runsFuture = _loadRuns(); // Runs tab — refresh list
+            if (i == 1) _hcRunsFuture = _loadHcRuns(); // refresh on open
           });
           // Run the idle location preview only while on the Record tab.
-          if (i == 1) {
+          if (i == 2) {
             _startLocationPreview();
           } else {
             _stopLocationPreview();
           }
         },
-        destinations: destinations,
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.home_outlined),
+            selectedIcon: Icon(Icons.home),
+            label: 'Home',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.directions_run_outlined),
+            selectedIcon: Icon(Icons.directions_run),
+            label: 'Runs',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.fiber_manual_record_outlined),
+            selectedIcon: Icon(Icons.fiber_manual_record),
+            label: 'Record',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.bug_report_outlined),
+            selectedIcon: Icon(Icons.bug_report),
+            label: 'Debug',
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Signed-out landing: team logo, welcome message, and sign-in — no other
+  // buttons, no bottom nav.
+  Widget _buildWelcome(ThemeData theme) {
+    return Scaffold(
+      body: SafeArea(
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(32),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(32),
+                  child: Image.asset(
+                    'assets/icon/app_icon.jpg',
+                    width: 160,
+                    height: 160,
+                  ),
+                ),
+                const SizedBox(height: 32),
+                Text(
+                  'Chadwick XC Training',
+                  style: theme.textTheme.headlineMedium?.copyWith(
+                    fontWeight: FontWeight.bold,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Welcome! Sign in to share your training data with the team.',
+                  style: theme.textTheme.bodyLarge,
+                  textAlign: TextAlign.center,
+                ),
+                const SizedBox(height: 40),
+                FilledButton.icon(
+                  onPressed: _auth.isGoogleConfigured
+                      ? _signInWithGoogle
+                      : null,
+                  icon: const Icon(Icons.login),
+                  label: Text(
+                    _auth.isGoogleConfigured
+                        ? 'Sign in with Google'
+                        : 'Google Sign-In not configured',
+                  ),
+                  style: FilledButton.styleFrom(
+                    minimumSize: const Size.fromHeight(52),
+                  ),
+                ),
+                if (kDebugMode) ...[
+                  const SizedBox(height: 12),
+                  TextButton(
+                    onPressed: _signInWithDevEmail,
+                    child: const Text('Dev sign-in (debug builds only)'),
+                  ),
+                ],
+                if (_signInError != null) ...[
+                  const SizedBox(height: 24),
+                  Text(
+                    _signInError!,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.error,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Post-sign-in setup: health permissions → route access → automatic-upload
+  // choice. One step is active at a time; completed steps get a check.
+  Widget _buildOnboarding(ThemeData theme) {
+    final autoDone = _autoSyncEnabled != null;
+
+    Widget step(int n, String title, bool done, bool active) {
+      return ListTile(
+        leading: done
+            ? Icon(Icons.check_circle, color: theme.colorScheme.primary)
+            : CircleAvatar(
+                radius: 14,
+                backgroundColor: active
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.surfaceContainerHighest,
+                foregroundColor: active
+                    ? theme.colorScheme.onPrimary
+                    : theme.colorScheme.onSurfaceVariant,
+                child: Text('$n'),
+              ),
+        title: Text(
+          title,
+          style: active ? const TextStyle(fontWeight: FontWeight.w600) : null,
+        ),
+      );
+    }
+
+    final healthActive = !_permissionsGranted;
+    final routeActive = _permissionsGranted && !_routeAccessDone;
+    final autoActive = _permissionsGranted && _routeAccessDone && !autoDone;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Chadwick XC Training'),
+        centerTitle: true,
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(
+              "Let's get you set up",
+              style: theme.textTheme.headlineSmall?.copyWith(
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'Three quick steps so your training data reaches the team.',
+              style: theme.textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 16),
+            Card(
+              child: Column(
+                children: [
+                  step(
+                    1,
+                    'Allow health data access',
+                    _permissionsGranted,
+                    healthActive,
+                  ),
+                  step(
+                    2,
+                    'Allow workout route access',
+                    _routeAccessDone,
+                    routeActive,
+                  ),
+                  step(3, 'Choose automatic upload', autoDone, autoActive),
+                ],
+              ),
+            ),
+            const SizedBox(height: 24),
+            if (healthActive)
+              FilledButton.icon(
+                onPressed: _requestPermissions,
+                icon: const Icon(Icons.favorite),
+                label: const Text('Allow health data access'),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(52),
+                ),
+              )
+            else if (routeActive) ...[
+              FilledButton.icon(
+                onPressed: _grantRouteAccess,
+                icon: const Icon(Icons.route),
+                label: const Text('Allow workout route access'),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(52),
+                ),
+              ),
+              const SizedBox(height: 8),
+              TextButton(
+                onPressed: _markRouteAccessDone,
+                child: const Text('Skip for now'),
+              ),
+            ] else if (autoActive) ...[
+              Text(
+                'Upload your workouts automatically whenever you open the app?',
+                style: theme.textTheme.bodyLarge,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                onPressed: () => _setAutoSync(true),
+                icon: const Icon(Icons.cloud_upload),
+                label: const Text('Yes, upload automatically'),
+                style: FilledButton.styleFrom(
+                  minimumSize: const Size.fromHeight(52),
+                ),
+              ),
+              const SizedBox(height: 8),
+              OutlinedButton(
+                onPressed: () => _setAutoSync(false),
+                style: OutlinedButton.styleFrom(
+                  minimumSize: const Size.fromHeight(52),
+                ),
+                child: const Text("No, I'll sync manually"),
+              ),
+            ],
+            const SizedBox(height: 24),
+            Text(
+              _status,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -2244,8 +2742,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   List<LatLng> _recordPolyline() {
     if (_smoothedAtLength != _track.length) {
       _smoothedAtLength = _track.length;
-      _smoothedTrack =
-          smoothPath([for (final p in _track) LatLng(p.lat, p.lng)]);
+      _smoothedTrack = smoothPath([
+        for (final p in _track) LatLng(p.lat, p.lng),
+      ]);
     }
     return _smoothedTrack;
   }
@@ -2270,14 +2769,13 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               final centered = _lastFix == null
                   ? true
                   : Geolocator.distanceBetween(
-                        camera.center.latitude,
-                        camera.center.longitude,
-                        _lastFix!.latitude,
-                        _lastFix!.longitude,
-                      ) <=
-                      25;
-              if (camera.rotation != _mapRotation ||
-                  centered != _mapCentered) {
+                          camera.center.latitude,
+                          camera.center.longitude,
+                          _lastFix!.latitude,
+                          _lastFix!.longitude,
+                        ) <=
+                        25;
+              if (camera.rotation != _mapRotation || centered != _mapCentered) {
                 setState(() {
                   _mapRotation = camera.rotation;
                   _mapCentered = centered;
@@ -2397,7 +2895,175 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     );
   }
 
-  // Runs page: list of saved tracks, newest first. Tapping opens it on a map.
+  // Loads workouts other apps wrote to Health Connect (last 30 days) and
+  // groups time-overlapping ones into logical runs — see _HcRun.
+  Future<List<_HcRun>> _loadHcRuns() async {
+    final now = DateTime.now();
+    final workouts = await _safeRead(
+      HealthDataType.WORKOUT,
+      now.subtract(_firstSyncWindow),
+      now,
+    );
+    workouts.sort((a, b) => a.dateFrom.compareTo(b.dateFrom));
+    final runs = <_HcRun>[];
+    for (final w in workouts) {
+      if (runs.isNotEmpty && runs.last.overlaps(w)) {
+        runs.last.add(w);
+      } else {
+        runs.add(_HcRun(w));
+      }
+    }
+    return runs.reversed.toList(); // newest first
+  }
+
+  // 'com.fitbit.FitbitMobile' -> 'Fitbit', 'com.strava' -> 'Strava', etc.
+  String _prettySource(String source) {
+    const known = {
+      'com.strava': 'Strava',
+      'com.fitbit.FitbitMobile': 'Fitbit',
+      'com.google.android.apps.fitness': 'Google Fit',
+      'com.google.android.apps.healthdata': 'Health Connect',
+    };
+    final k = known[source];
+    if (k != null) return k;
+    final seg = source.split('.').last;
+    return seg.isEmpty ? source : seg[0].toUpperCase() + seg.substring(1);
+  }
+
+  // 'TRAIL_RUNNING' -> 'Trail running'.
+  String _prettyActivity(String name) {
+    final lower = name.replaceAll('_', ' ').toLowerCase();
+    return lower[0].toUpperCase() + lower.substring(1);
+  }
+
+  IconData _activityIcon(String name) {
+    if (name.contains('RUN')) return Icons.directions_run;
+    if (name.contains('WALK') || name.contains('HIK')) {
+      return Icons.directions_walk;
+    }
+    if (name.contains('BIK') || name.contains('CYCL')) {
+      return Icons.pedal_bike;
+    }
+    if (name.contains('SWIM')) return Icons.pool;
+    return Icons.fitness_center;
+  }
+
+  // Runs tab: workouts recorded by other apps (Fitbit, Strava, ...), grouped
+  // per physical run. Tapping shows the GPS route when one is available.
+  Widget _buildHcRunsPage(ThemeData theme) {
+    return FutureBuilder<List<_HcRun>>(
+      future: _hcRunsFuture ??= _loadHcRuns(),
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        final runs = snap.data ?? [];
+        if (runs.isEmpty) {
+          return const Center(
+            child: Padding(
+              padding: EdgeInsets.all(32),
+              child: Text(
+                'No workouts found in the last 30 days.\n'
+                'Runs recorded by Fitbit, Strava, and other apps connected '
+                'to Health Connect show up here.',
+                textAlign: TextAlign.center,
+              ),
+            ),
+          );
+        }
+        return ListView.separated(
+          itemCount: runs.length,
+          separatorBuilder: (_, _) => const Divider(height: 1),
+          itemBuilder: (context, i) {
+            final r = runs[i];
+            final dist = r.distanceMeters;
+            final parts = <String>[
+              if (dist != null) '${(dist / 1000).toStringAsFixed(2)} km',
+              _fmtDuration(r.duration),
+              r.sources.map(_prettySource).join(' + '),
+            ];
+            return ListTile(
+              leading: Icon(_activityIcon(r.activityType)),
+              title: Text(
+                '${_prettyActivity(r.activityType)} · '
+                '${_fmtRunDate(r.start.toUtc())}',
+              ),
+              subtitle: Text(parts.join(' · ')),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => _openHcRun(r),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  // Fetches the GPS route for a grouped run: the route record whose workout
+  // uuid belongs to the group (any overlapping route as fallback).
+  Future<({List<LatLng>? points, bool consentBlocked})> _routeForRun(
+    _HcRun run,
+  ) async {
+    final records = await _safeRead(
+      HealthDataType.WORKOUT_ROUTE,
+      run.start.subtract(const Duration(minutes: 5)),
+      run.end.add(const Duration(minutes: 5)),
+    );
+    var consentBlocked = false;
+    for (final p in records) {
+      final v = p.value;
+      if (v is! WorkoutRouteHealthValue) continue;
+      final matches =
+          v.workoutUuid == null ||
+          run.uuids.contains(v.workoutUuid) ||
+          run.uuids.contains(p.uuid);
+      if (!matches) continue;
+      if (v.locations.isNotEmpty) {
+        return (
+          points: [
+            for (final l in v.locations) LatLng(l.latitude, l.longitude),
+          ],
+          consentBlocked: false,
+        );
+      }
+      consentBlocked = true; // route exists but HC withheld the points
+    }
+    return (points: null, consentBlocked: consentBlocked);
+  }
+
+  Future<void> _openHcRun(_HcRun run) async {
+    final route = await _routeForRun(run);
+    if (!mounted) return;
+    final pts = route.points;
+    if (pts != null && pts.length >= 2) {
+      final dist = run.distanceMeters;
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => _RunMapPage(
+            title:
+                '${_prettyActivity(run.activityType)} · ${_fmtRunDate(run.start.toUtc())}',
+            subtitle:
+                '${dist != null ? "${(dist / 1000).toStringAsFixed(2)} km · " : ""}'
+                '${_fmtDuration(run.duration)} · '
+                '${run.sources.map(_prettySource).join(" + ")}',
+            points: pts,
+          ),
+        ),
+      );
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          route.consentBlocked
+              ? 'This run has a route, but Health Connect needs the '
+                    '"Exercise routes" permission to show it.'
+              : 'No GPS route was recorded for this run.',
+        ),
+      ),
+    );
+  }
+
+  // Debug-only: list of runs recorded in-app (local files), newest first.
   Widget _buildRunsPage(ThemeData theme) {
     return FutureBuilder<List<_RunSummary>>(
       future: _runsFuture ?? _loadRuns(),
@@ -2425,8 +3091,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             return ListTile(
               leading: const Icon(Icons.route),
               title: Text(_fmtRunDate(r.start)),
-              subtitle: Text('${r.km.toStringAsFixed(2)} km · '
-                  '${_fmtDuration(r.duration)} · ${r.pointCount} pts'),
+              subtitle: Text(
+                '${r.km.toStringAsFixed(2)} km · '
+                '${_fmtDuration(r.duration)} · ${r.pointCount} pts',
+              ),
               trailing: const Icon(Icons.chevron_right),
               onTap: () => _openRun(r),
               onLongPress: () => _confirmDeleteRun(r),
@@ -2439,19 +3107,22 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<List<_RunSummary>> _loadRuns() async {
     final dir = await getApplicationDocumentsDirectory();
-    final files = dir.listSync().whereType<File>().where((f) =>
-        f.path.endsWith('.json') && f.path.contains('xc_route_'));
+    final files = dir.listSync().whereType<File>().where(
+      (f) => f.path.endsWith('.json') && f.path.contains('xc_route_'),
+    );
     final runs = <_RunSummary>[];
     for (final f in files) {
       try {
         final m = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
-        runs.add(_RunSummary(
-          file: f,
-          start: DateTime.parse(m['start_time'] as String),
-          km: (m['distance_meters'] as num).toDouble() / 1000,
-          duration: Duration(seconds: (m['duration_seconds'] as num).toInt()),
-          pointCount: (m['point_count'] as num).toInt(),
-        ));
+        runs.add(
+          _RunSummary(
+            file: f,
+            start: DateTime.parse(m['start_time'] as String),
+            km: (m['distance_meters'] as num).toDouble() / 1000,
+            duration: Duration(seconds: (m['duration_seconds'] as num).toInt()),
+            pointCount: (m['point_count'] as num).toInt(),
+          ),
+        );
       } catch (_) {
         // Skip malformed files.
       }
@@ -2508,14 +3179,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           LatLng((p['lat'] as num).toDouble(), (p['lng'] as num).toDouble()),
       ];
       if (!mounted) return;
-      await Navigator.of(context).push(MaterialPageRoute(
-        builder: (_) => _RunMapPage(
-          title: _fmtRunDate(r.start),
-          subtitle: '${r.km.toStringAsFixed(2)} km · '
-              '${_fmtDuration(r.duration)} · ${r.pointCount} points',
-          points: pts,
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => _RunMapPage(
+            title: _fmtRunDate(r.start),
+            subtitle:
+                '${r.km.toStringAsFixed(2)} km · '
+                '${_fmtDuration(r.duration)} · ${r.pointCount} points',
+            points: pts,
+          ),
         ),
-      ));
+      );
     } catch (e) {
       if (!mounted) return;
       setState(() => _status = 'Could not open run: $e');
@@ -2525,8 +3199,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   String _fmtRunDate(DateTime utc) {
     final d = utc.toLocal();
     const months = [
-      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
     ];
     final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
     final ampm = d.hour < 12 ? 'AM' : 'PM';
@@ -2537,15 +3221,43 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget _recordStat(ThemeData theme, String value, String label) {
     return Column(
       children: [
-        Text(value,
-            style: theme.textTheme.titleLarge
-                ?.copyWith(fontWeight: FontWeight.bold)),
+        Text(
+          value,
+          style: theme.textTheme.titleLarge?.copyWith(
+            fontWeight: FontWeight.bold,
+          ),
+        ),
         Text(label, style: theme.textTheme.bodySmall),
       ],
     );
   }
 
+  // Signed-in home: upload status front and center. The Sync button appears
+  // only when there is data the server doesn't have yet.
   Widget _buildHomePage(ThemeData theme) {
+    final pending = _pendingSamples;
+    final behind = pending != null && pending != 0;
+
+    final String statusLine;
+    final IconData statusIcon;
+    if (_uploading) {
+      statusIcon = Icons.cloud_upload;
+      statusLine = _status; // live progress from the sync
+    } else if (pending == null) {
+      statusIcon = Icons.cloud_queue;
+      statusLine = 'Checking for new data…';
+    } else if (pending == -1) {
+      statusIcon = Icons.cloud_off;
+      statusLine =
+          'Nothing uploaded yet — tap Sync to upload your last 30 days.';
+    } else if (pending == 0) {
+      statusIcon = Icons.cloud_done;
+      statusLine = 'All data uploaded.';
+    } else {
+      statusIcon = Icons.cloud_upload;
+      statusLine = '$pending new samples since your last sync.';
+    }
+
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24.0),
       child: Column(
@@ -2553,86 +3265,74 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         children: [
           _buildAuthCard(theme),
           const SizedBox(height: 16),
-          _buildStatusCard(theme),
-          const SizedBox(height: 16),
-          if (!_permissionsGranted)
-            FilledButton.icon(
-              onPressed: _requestPermissions,
-              icon: const Icon(Icons.lock_open),
-              label: const Text('Request Permissions'),
-            ),
-          if (_permissionsGranted)
-            FilledButton.tonal(
-              onPressed: _uploading ? null : _readHeartRate,
-              child: const Row(
-                mainAxisAlignment: MainAxisAlignment.center,
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Icon(Icons.favorite),
-                  SizedBox(width: 8),
-                  Text('Read My Heart Rate'),
-                ],
-              ),
-            ),
-          const SizedBox(height: 12),
-          if (_permissionsGranted)
-            FilledButton(
-              onPressed:
-                  (_uploading || !_auth.isSignedIn) ? null : _syncHealthData,
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  if (_uploading)
-                    const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.white,
+                  Row(
+                    children: [
+                      if (_uploading || pending == null)
+                        const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      else
+                        Icon(statusIcon, color: theme.colorScheme.primary),
+                      const SizedBox(width: 12),
+                      Text(
+                        'Upload status',
+                        style: theme.textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
                       ),
-                    )
-                  else
-                    const Icon(Icons.cloud_upload),
-                  const SizedBox(width: 8),
-                  Text(_uploading
-                      ? 'Uploading...'
-                      : _auth.isSignedIn
-                          ? 'Sync to Server'
-                          : 'Sign in to sync'),
-                ],
-              ),
-            ),
-          const SizedBox(height: 24),
-          if (_heartRateValue != null)
-            Card(
-              color: theme.colorScheme.primaryContainer,
-              child: Padding(
-                padding: const EdgeInsets.all(24.0),
-                child: Column(
-                  children: [
-                    Icon(
-                      Icons.favorite,
-                      size: 48,
-                      color: theme.colorScheme.primary,
-                    ),
-                    const SizedBox(height: 12),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Text(statusLine),
+                  if (!_uploading && _lastSyncAt != null) ...[
+                    const SizedBox(height: 8),
                     Text(
-                      _heartRateValue!,
-                      style: theme.textTheme.headlineMedium?.copyWith(
-                        fontWeight: FontWeight.bold,
-                        color: theme.colorScheme.onPrimaryContainer,
-                      ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      _heartRateTime!,
-                      style: theme.textTheme.bodyMedium?.copyWith(
-                        color: theme.colorScheme.onPrimaryContainer,
+                      'Last synced: ${_fmtRunDate(_lastSyncAt!.toUtc())}',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
                   ],
-                ),
+                ],
               ),
             ),
+          ),
+          const SizedBox(height: 16),
+          if (!_uploading && behind)
+            FilledButton.icon(
+              onPressed: _syncHealthData,
+              icon: const Icon(Icons.cloud_upload),
+              label: const Text('Sync to Server'),
+              style: FilledButton.styleFrom(
+                minimumSize: const Size.fromHeight(52),
+              ),
+            ),
+          const SizedBox(height: 16),
+          Card(
+            child: SwitchListTile(
+              title: const Text('Upload automatically'),
+              subtitle: const Text('Sync whenever the app opens'),
+              value: _autoSyncEnabled ?? false,
+              onChanged: _uploading ? null : (v) => _setAutoSync(v),
+            ),
+          ),
+          if (!_uploading) ...[
+            const SizedBox(height: 16),
+            Text(
+              _status,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -2645,7 +3345,10 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Widget _buildDebugPage(ThemeData theme) {
     final orange = Colors.orange.shade800;
     OutlinedButton debugButton(
-        IconData icon, String label, VoidCallback onPressed) {
+      IconData icon,
+      String label,
+      VoidCallback onPressed,
+    ) {
       return OutlinedButton.icon(
         onPressed: _uploading ? null : onPressed,
         icon: Icon(icon),
@@ -2676,26 +3379,55 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
             ),
           // Independent of health permissions — wipes server data + sync state.
-          debugButton(Icons.restart_alt, 'Reset (wipe server + start over)',
-              _resetSyncWatermark),
+          debugButton(
+            Icons.restart_alt,
+            'Reset (wipe server + start over)',
+            _resetSyncWatermark,
+          ),
           const SizedBox(height: 8),
-          debugButton(Icons.route, 'Grant HC Route Access',
-              _grantRouteAccess),
+          debugButton(Icons.route, 'Grant HC Route Access', _grantRouteAccess),
+          const SizedBox(height: 8),
+          // In-app recordings live on as a dev tool; the Runs tab now shows
+          // Health Connect workouts instead.
+          debugButton(Icons.folder_open, 'Local Recorded Runs', () {
+            _runsFuture = _loadRuns();
+            Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (_) => Scaffold(
+                  appBar: AppBar(
+                    title: const Text('Local Recorded Runs'),
+                    centerTitle: true,
+                  ),
+                  body: _buildRunsPage(theme),
+                ),
+              ),
+            );
+          }),
           const SizedBox(height: 8),
           if (_permissionsGranted) ...[
-            debugButton(
-                Icons.search, 'Discover Workout Data', _discoverWorkoutData),
+            debugButton(Icons.favorite, 'Read Heart Rate', _readHeartRate),
             const SizedBox(height: 8),
             debugButton(
-                Icons.travel_explore, 'Scan All Data (30d)', _discoverAllData),
+              Icons.search,
+              'Discover Workout Data',
+              _discoverWorkoutData,
+            ),
+            const SizedBox(height: 8),
+            debugButton(
+              Icons.travel_explore,
+              'Scan All Data (30d)',
+              _discoverAllData,
+            ),
             const SizedBox(height: 8),
             debugButton(Icons.file_download, 'Export to File', _exportToFile),
             const SizedBox(height: 8),
-            debugButton(Icons.edit, 'Request WRITE Permissions',
-                _requestWritePermissions),
-            const SizedBox(height: 8),
             debugButton(
-                Icons.file_upload, 'Import from File', _importFromFile),
+              Icons.edit,
+              'Request WRITE Permissions',
+              _requestWritePermissions,
+            ),
+            const SizedBox(height: 8),
+            debugButton(Icons.file_upload, 'Import from File', _importFromFile),
           ],
         ],
       ),
