@@ -166,6 +166,28 @@ class _HcRun {
     return best;
   }
 
+  double? get energyKcal {
+    double? best;
+    for (final m in members) {
+      final v = m.value;
+      final e = v is WorkoutHealthValue
+          ? v.totalEnergyBurned?.toDouble()
+          : null;
+      if (e != null && (best == null || e > best)) best = e;
+    }
+    return best;
+  }
+
+  int? get steps {
+    int? best;
+    for (final m in members) {
+      final v = m.value;
+      final s = v is WorkoutHealthValue ? v.totalSteps?.toInt() : null;
+      if (s != null && (best == null || s > best)) best = s;
+    }
+    return best;
+  }
+
   List<String> get sources {
     final seen = <String>{};
     return [
@@ -204,49 +226,63 @@ class _RunMapPage extends StatelessWidget {
       ),
       body: points.isEmpty
           ? const Center(child: Text('No points in this run.'))
-          : FlutterMap(
-              options: MapOptions(
-                initialCenter: points.first,
-                initialZoom: 16,
-                initialCameraFit: points.length >= 2
-                    ? CameraFit.coordinates(
-                        coordinates: points,
-                        padding: const EdgeInsets.all(40),
-                      )
-                    : null,
-              ),
-              children: [
-                TileLayer(
-                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                  userAgentPackageName: 'com.github.briansp2020.xctraining',
-                ),
-                PolylineLayer(
-                  polylines: [
-                    Polyline(
-                      points: smoothPath(points),
-                      strokeWidth: 5,
-                      color: theme.colorScheme.primary,
-                    ),
-                  ],
-                ),
-                MarkerLayer(
-                  markers: [
-                    Marker(
-                      point: points.first,
-                      width: 16,
-                      height: 16,
-                      child: _dot(Colors.green),
-                    ),
-                    Marker(
-                      point: points.last,
-                      width: 16,
-                      height: 16,
-                      child: _dot(Colors.red),
-                    ),
-                  ],
-                ),
-              ],
+          : _RouteMapView(points),
+    );
+  }
+}
+
+// The map itself: route polyline with start/end markers, framed to fit.
+// Shared by the full-page map (_RunMapPage) and the run detail page.
+class _RouteMapView extends StatelessWidget {
+  final List<LatLng> points;
+
+  const _RouteMapView(this.points);
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return FlutterMap(
+      options: MapOptions(
+        initialCenter: points.first,
+        initialZoom: 16,
+        initialCameraFit: points.length >= 2
+            ? CameraFit.coordinates(
+                coordinates: points,
+                padding: const EdgeInsets.all(40),
+              )
+            : null,
+      ),
+      children: [
+        TileLayer(
+          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+          userAgentPackageName: 'com.github.briansp2020.xctraining',
+        ),
+        PolylineLayer(
+          polylines: [
+            Polyline(
+              points: smoothPath(points),
+              strokeWidth: 5,
+              color: theme.colorScheme.primary,
             ),
+          ],
+        ),
+        MarkerLayer(
+          markers: [
+            Marker(
+              point: points.first,
+              width: 16,
+              height: 16,
+              child: _dot(Colors.green),
+            ),
+            Marker(
+              point: points.last,
+              width: 16,
+              height: 16,
+              child: _dot(Colors.red),
+            ),
+          ],
+        ),
+      ],
     );
   }
 
@@ -255,6 +291,104 @@ class _RunMapPage extends StatelessWidget {
       color: c,
       shape: BoxShape.circle,
       border: Border.all(color: Colors.white, width: 2),
+    ),
+  );
+}
+
+// One metric shown on the run detail page.
+class _RunStat {
+  final IconData icon;
+  final String label;
+  final String value;
+
+  const _RunStat(this.icon, this.label, this.value);
+}
+
+// Detail view for a run recorded by another app: its health metrics, with the
+// GPS route shown on top when one is available. When there's no route we simply
+// show the metrics — no empty-map placeholder.
+class _HcRunDetailPage extends StatelessWidget {
+  final String title;
+  final String subtitle;
+  final List<_RunStat> stats;
+  final List<LatLng>? points;
+  final bool consentBlocked;
+
+  const _HcRunDetailPage({
+    required this.title,
+    required this.subtitle,
+    required this.stats,
+    required this.points,
+    required this.consentBlocked,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final pts = points;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(title),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(24),
+          child: Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Text(subtitle, style: theme.textTheme.bodySmall),
+          ),
+        ),
+      ),
+      body: ListView(
+        children: [
+          if (pts != null) SizedBox(height: 320, child: _RouteMapView(pts)),
+          if (pts == null && consentBlocked)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+              child: Text(
+                'This run has a route. Enable the "Exercise routes" permission '
+                'in Health Connect to see it here.',
+                style: theme.textTheme.bodySmall,
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              children: [for (final s in stats) _statCard(theme, s)],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static Widget _statCard(ThemeData theme, _RunStat s) => Container(
+    width: 104,
+    padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 8),
+    decoration: BoxDecoration(
+      color: theme.colorScheme.surfaceContainerHighest,
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: Column(
+      children: [
+        Icon(s.icon, size: 22, color: theme.colorScheme.primary),
+        const SizedBox(height: 8),
+        Text(
+          s.value,
+          textAlign: TextAlign.center,
+          style: theme.textTheme.titleMedium?.copyWith(
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          s.label,
+          textAlign: TextAlign.center,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+      ],
     ),
   );
 }
@@ -2440,35 +2574,67 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _openHcRun(_HcRun run) async {
     final route = await _routeForRun(run);
-    if (!mounted) return;
-    final pts = route.points;
-    if (pts != null && pts.length >= 2) {
-      final dist = run.distanceMeters;
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => _RunMapPage(
-            title:
-                '${_prettyActivity(run.activityType)} · ${_fmtRunDate(run.start.toUtc())}',
-            subtitle:
-                '${dist != null ? "${(dist / 1000).toStringAsFixed(2)} km · " : ""}'
-                '${_fmtDuration(run.duration)} · '
-                '${run.sources.map(_prettySource).join(" + ")}',
-            points: pts,
-          ),
-        ),
-      );
-      return;
+
+    // Average / max heart rate over the run window, if any HR was recorded.
+    int? avgHr, maxHr;
+    try {
+      final hr = await _safeRead(HealthDataType.HEART_RATE, run.start, run.end);
+      final bpms = <double>[
+        for (final p in hr)
+          if (p.value is NumericHealthValue)
+            (p.value as NumericHealthValue).numericValue.toDouble(),
+      ];
+      if (bpms.isNotEmpty) {
+        avgHr = (bpms.reduce((a, b) => a + b) / bpms.length).round();
+        maxHr = bpms.reduce((a, b) => a > b ? a : b).round();
+      }
+    } catch (e) {
+      debugPrint('HR read for run failed: $e');
     }
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          route.consentBlocked
-              ? 'This run has a route, but Health Connect needs the '
-                    '"Exercise routes" permission to show it.'
-              : 'No GPS route was recorded for this run.',
+    if (!mounted) return;
+
+    final km = run.distanceMeters != null ? run.distanceMeters! / 1000 : null;
+    final energy = run.energyKcal;
+    final steps = run.steps;
+    final stats = <_RunStat>[
+      if (km != null)
+        _RunStat(Icons.straighten, 'Distance', '${km.toStringAsFixed(2)} km'),
+      _RunStat(Icons.timer_outlined, 'Duration', _fmtDuration(run.duration)),
+      if (km != null && km > 0)
+        _RunStat(Icons.speed, 'Pace', _fmtPace(run.duration, km)),
+      if (energy != null)
+        _RunStat(
+          Icons.local_fire_department,
+          'Energy',
+          '${energy.round()} kcal',
+        ),
+      if (steps != null) _RunStat(Icons.directions_walk, 'Steps', '$steps'),
+      if (avgHr != null) _RunStat(Icons.favorite, 'Avg HR', '$avgHr bpm'),
+      if (maxHr != null)
+        _RunStat(Icons.favorite_border, 'Max HR', '$maxHr bpm'),
+    ];
+
+    final pts = route.points;
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => _HcRunDetailPage(
+          title:
+              '${_prettyActivity(run.activityType)} · ${_fmtRunDate(run.start.toUtc())}',
+          subtitle: run.sources.map(_prettySource).join(' + '),
+          stats: stats,
+          points: (pts != null && pts.length >= 2) ? pts : null,
+          consentBlocked: route.consentBlocked,
         ),
       ),
     );
+  }
+
+  // Pace as m:ss per km.
+  String _fmtPace(Duration d, double km) {
+    final secPerKm = (d.inSeconds / km).round();
+    final m = secPerKm ~/ 60;
+    final s = secPerKm % 60;
+    return '$m:${s.toString().padLeft(2, '0')} /km';
   }
 
   // Debug-only: list of runs recorded in-app (local files), newest first.
