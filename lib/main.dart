@@ -1,8 +1,5 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math' as math;
-import 'dart:ui' as ui; // Path is qualified to avoid latlong2's Path class
 
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
@@ -81,23 +78,10 @@ const String _autoSyncPrefsKey = 'auto_sync_enabled';
 // UUID upsert dedup makes the wider re-query harmless.
 const Duration _watermarkOverlap = Duration(hours: 24);
 
-// Zoom the Record map opens at, and snaps back to when the recenter button is
-// tapped. 18 is a tight, street-level view.
-const double _recordMapZoom = 18;
-
 // Moving-average window for smoothing the *displayed* GPS path — tames the
-// zigzag from slow walking / GPS jitter. Raw points are kept intact for upload;
-// only the drawn polyline is smoothed. Higher = smoother but rounds corners
-// more; set to 1 to disable.
+// zigzag from GPS jitter. Raw points are kept intact; only the drawn polyline
+// is smoothed. Higher = smoother but rounds corners more; 1 disables.
 const int _pathSmoothingWindow = 7;
-
-// Recording-quality gates. Drop fixes worse than _gpsAccuracyThresholdM meters
-// (a poor fix scatters the path and inflates distance), and reject any leg
-// implying a speed above _gpsMaxSpeedMps — a GPS multipath spike, not real
-// movement (~12 m/s is faster than a world-class sprint, so legit running is
-// never dropped). These guard the recorded distance metric only.
-const double _gpsAccuracyThresholdM = 25;
-const double _gpsMaxSpeedMps = 12;
 
 // Returns a smoothed copy of [pts] using a centered moving average. Endpoints
 // are preserved (the window shrinks at the edges).
@@ -116,35 +100,6 @@ List<LatLng> smoothPath(List<LatLng> pts, {int window = _pathSmoothingWindow}) {
     out.add(LatLng(lat / n, lng / n));
   }
   return out;
-}
-
-// One GPS fix in a recorded route. Serialized to the local track JSON; this
-// shape is what a future server route-upload endpoint will consume.
-class _TrackPoint {
-  final double lat;
-  final double lng;
-  final DateTime time;
-  final double accuracy; // meters
-  final double altitude; // meters
-  final double speed; // m/s
-
-  _TrackPoint({
-    required this.lat,
-    required this.lng,
-    required this.time,
-    required this.accuracy,
-    required this.altitude,
-    required this.speed,
-  });
-
-  Map<String, dynamic> toJson() => {
-    'lat': lat,
-    'lng': lng,
-    'time': time.toUtc().toIso8601String(),
-    'accuracy_m': accuracy,
-    'altitude_m': altitude,
-    'speed_mps': speed,
-  };
 }
 
 // Summary of a saved run, parsed from a track JSON file for the Runs list.
@@ -304,45 +259,6 @@ class _RunMapPage extends StatelessWidget {
   );
 }
 
-// A compass needle (red = north, grey = south) that counter-rotates with the
-// map so it keeps pointing at true north — like Google Maps' compass button.
-class _CompassNeedle extends StatelessWidget {
-  final double bearingDeg;
-  const _CompassNeedle({required this.bearingDeg});
-
-  @override
-  Widget build(BuildContext context) {
-    return Transform.rotate(
-      angle: -bearingDeg * math.pi / 180,
-      child: CustomPaint(size: const Size(18, 18), painter: _NeedlePainter()),
-    );
-  }
-}
-
-class _NeedlePainter extends CustomPainter {
-  @override
-  void paint(Canvas canvas, Size size) {
-    final cx = size.width / 2;
-    final cy = size.height / 2;
-    final half = size.width * 0.28;
-    final north = ui.Path()
-      ..moveTo(cx, 0)
-      ..lineTo(cx - half, cy)
-      ..lineTo(cx + half, cy)
-      ..close();
-    final south = ui.Path()
-      ..moveTo(cx, size.height)
-      ..lineTo(cx - half, cy)
-      ..lineTo(cx + half, cy)
-      ..close();
-    canvas.drawPath(north, Paint()..color = const Color(0xFFD32F2F)); // N: red
-    canvas.drawPath(south, Paint()..color = const Color(0xFF9E9E9E)); // S: grey
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
-}
-
 void main() {
   runApp(const XCTrainingApp());
 }
@@ -372,7 +288,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
+class _HomeScreenState extends State<HomeScreen> {
   // Native bridge for Health Connect's route-consent dialogs (MainActivity.kt).
   // The health plugin can't request route access — see _grantRouteAccess.
   static const MethodChannel _routeAccess = MethodChannel(
@@ -407,40 +323,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int? _pendingSamples;
   DateTime? _lastSyncAt;
 
-  // DIY GPS route recording (foreground only for now). _track accumulates fixes
-  // while _recording; _distanceMeters is summed incrementally between fixes.
-  bool _recording = false;
-  bool _startingRun = false; // re-entrancy guard for _startRecording
-  final List<_TrackPoint> _track = [];
-  double _distanceMeters = 0;
-  DateTime? _recordStart;
-  Duration _elapsed = Duration.zero;
-  StreamSubscription<Position>? _posSub;
-  Timer? _tick;
-
-  // Map state for the Record page. _lastFix drives the "you are here" marker
-  // and camera follow; updated by a live preview stream while on the tab (idle)
-  // and by each recording fix.
-  final MapController _mapController = MapController();
-  LatLng? _lastFix;
-  // Last idle-preview GPS error, shown in the Record map banner instead of an
-  // indefinite "Locating you…" when no fix has arrived yet. Cleared on a fix.
-  String? _gpsError;
-  // Idle location preview stream (Record tab, not recording).
-  StreamSubscription<Position>? _previewSub;
-  // Tracked from the map's onPositionChanged so the recenter button can reflect
-  // state: crosshair when off-center, compass (needle to north) when centered
-  // but rotated.
-  double _mapRotation = 0;
-  bool _mapCentered = true;
-
-  // Memoized smoothed polyline for the Record map, keyed on _track.length so a
-  // per-second timer tick doesn't re-run the O(n·window) smoothing when the
-  // track hasn't grown. Points are only ever appended, so length is a
-  // sufficient invalidation key.
-  List<LatLng> _smoothedTrack = const [];
-  int _smoothedAtLength = -1;
-
   // Cached future for the debug local-recordings list — refreshed when opened
   // so a just-saved run shows up, without re-reading the dir on every rebuild.
   Future<List<_RunSummary>>? _runsFuture;
@@ -450,12 +332,8 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   Future<List<_HcRun>>? _hcRunsFuture;
 
   // Bottom-nav page index. Release: 0 = Home, 1 = Runs. Debug builds add
-  // 2 = Record and 3 = Debug tools.
+  // 2 = Debug tools.
   int _pageIndex = 0;
-
-  // The Record tab's nav index (debug builds only — release has no Record
-  // tab, so the preview-stream logic tied to this index never fires there).
-  static const int _recordTabIndex = 2;
 
   // Single source of truth for what the sync reads + what we request permission
   // for. Must match the manifest's READ_* declarations and the union of
@@ -499,7 +377,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _bootstrap();
   }
 
@@ -580,301 +457,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
-  @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _posSub?.cancel();
-    _previewSub?.cancel();
-    _tick?.cancel();
-    _mapController.dispose();
-    super.dispose();
-  }
-
-  // Stop the idle location preview when the app is backgrounded, and resume it
-  // on return (only if we're on the Record tab and not recording). A recording
-  // run is left alone — its foreground service is meant to keep GPS alive while
-  // backgrounded.
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (_recording) return;
-    if (state == AppLifecycleState.resumed) {
-      if (_pageIndex == _recordTabIndex) _startLocationPreview();
-    } else if (state == AppLifecycleState.paused) {
-      _stopLocationPreview();
-    }
-  }
-
-  // ---- DIY GPS route recording (Milestone A: foreground + local save) ----
-
-  // Ensures GPS is on and we hold at least while-in-use location permission.
-  // Background ("Allow all the time") is a later milestone.
-  Future<bool> _ensureLocationPermission() async {
-    if (!await Geolocator.isLocationServiceEnabled()) {
-      setState(
-        () => _status = 'Location is off — enable GPS, then start the run.',
-      );
-      return false;
-    }
-    var perm = await Geolocator.checkPermission();
-    if (perm == LocationPermission.denied) {
-      perm = await Geolocator.requestPermission();
-    }
-    if (perm == LocationPermission.denied ||
-        perm == LocationPermission.deniedForever) {
-      setState(
-        () => _status =
-            'Location permission denied. Grant it in Settings to record runs.',
-      );
-      return false;
-    }
-    return true;
-  }
-
-  Future<void> _startRecording() async {
-    // Guard re-entrancy: _recording isn't set until after the permission await
-    // below, so a fast double-tap (or a tap during the permission dialog) could
-    // otherwise start a second stream + timer and orphan the first. _startingRun
-    // is set synchronously, before the first await.
-    if (_recording || _startingRun) return;
-    _startingRun = true;
-    try {
-      if (!await _ensureLocationPermission()) return;
-      if (!mounted) return;
-      _stopLocationPreview(); // the recording stream takes over
-      setState(() {
-        _recording = true;
-        _track.clear();
-        _distanceMeters = 0;
-        _elapsed = Duration.zero;
-        _recordStart = DateTime.now();
-        _status =
-            'Recording run — you can lock the screen; '
-            'a notification keeps it tracking.';
-      });
-
-      // AndroidSettings (vs plain LocationSettings) lets geolocator promote its
-      // location service to a foreground service via foregroundNotificationConfig,
-      // which is what keeps GPS flowing with the screen off / app backgrounded.
-      // iOS would need AppleSettings here when iOS support is added.
-      final settings = AndroidSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 5, // meters between fixes — filters GPS jitter at rest
-        foregroundNotificationConfig: const ForegroundNotificationConfig(
-          notificationTitle: 'XC Training — recording run',
-          notificationText: 'Tracking your GPS route',
-          notificationChannelName: 'Run recording',
-          enableWakeLock:
-              true, // keep the CPU awake for GPS while screen is off
-          setOngoing: true, // can't be swiped away mid-run
-        ),
-      );
-      _posSub = Geolocator.getPositionStream(locationSettings: settings).listen(
-        (pos) {
-          if (!mounted) return;
-          final fix = LatLng(pos.latitude, pos.longitude);
-          // Don't RECORD low-quality fixes — a poor-accuracy fix scatters the
-          // path and its out-and-back leg inflates the distance — but do keep
-          // the marker/camera live so the map doesn't freeze in weak GPS. (A
-          // poor fix is roughly right, just imprecise; jump spikes below are
-          // wrong positions, so those don't move the marker either.)
-          if (pos.accuracy > _gpsAccuracyThresholdM) {
-            setState(() => _lastFix = fix);
-            _followCamera(fix);
-            return;
-          }
-          double? leg;
-          if (_track.isNotEmpty) {
-            final last = _track.last;
-            leg = Geolocator.distanceBetween(
-              last.lat,
-              last.lng,
-              pos.latitude,
-              pos.longitude,
-            );
-            // Reject implausible jumps (GPS multipath spikes): a leg implying a
-            // speed no runner can hit is a bad fix, not real distance.
-            final dt =
-                pos.timestamp.difference(last.time).inMilliseconds / 1000.0;
-            if (dt > 0 && leg / dt > _gpsMaxSpeedMps) return;
-          }
-          setState(() {
-            if (leg != null) _distanceMeters += leg;
-            _track.add(
-              _TrackPoint(
-                lat: pos.latitude,
-                lng: pos.longitude,
-                time: pos.timestamp,
-                accuracy: pos.accuracy,
-                altitude: pos.altitude,
-                speed: pos.speed,
-              ),
-            );
-            _lastFix = fix;
-          });
-          _followCamera(fix); // keep the map centered on the runner
-        },
-        onError: (e) {
-          if (!mounted) return;
-          setState(() => _status = 'GPS error: $e');
-        },
-      );
-
-      _tick = Timer.periodic(const Duration(seconds: 1), (_) {
-        if (!mounted || _recordStart == null) return;
-        setState(() => _elapsed = DateTime.now().difference(_recordStart!));
-      });
-    } finally {
-      _startingRun = false;
-    }
-  }
-
-  Future<void> _stopRecording() async {
-    final end = DateTime.now();
-    await _posSub?.cancel();
-    _posSub = null;
-    _tick?.cancel();
-    _tick = null;
-    final points = _track.toList();
-    if (!mounted) return;
-    setState(() => _recording = false);
-    if (_pageIndex == _recordTabIndex) {
-      _startLocationPreview(); // resume idle preview
-    }
-
-    if (points.isEmpty) {
-      setState(() => _status = 'Stopped — no GPS fixes captured.');
-      return;
-    }
-
-    // end_time is the stop moment (not the last GPS fix) so it stays
-    // consistent with duration — the tail of a run can be still, producing
-    // no new fixes, which would otherwise make end_time lag the real stop.
-    final start = _recordStart ?? points.first.time;
-    final duration = end.difference(start);
-    final payload = {
-      'type': 'route_track',
-      'source': 'diy_gps',
-      'recorded_at': end.toUtc().toIso8601String(),
-      'start_time': start.toUtc().toIso8601String(),
-      'end_time': end.toUtc().toIso8601String(),
-      'duration_seconds': duration.inSeconds,
-      'distance_meters': _distanceMeters,
-      'point_count': points.length,
-      'points': [for (final p in points) p.toJson()],
-    };
-
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final stamp = start.toUtc().toIso8601String().replaceAll(
-        RegExp(r'[:.]'),
-        '-',
-      );
-      final file = File('${dir.path}/xc_route_$stamp.json');
-      await file.writeAsString(jsonEncode(payload));
-      if (!mounted) return;
-      setState(() {
-        _status =
-            'Saved run: ${(_distanceMeters / 1000).toStringAsFixed(2)} km, '
-            '${_fmtDuration(duration)}, ${points.length} points\n→ ${file.path}';
-        // The run is saved (from the points snapshot above) — clear the live
-        // track so its polyline doesn't linger on the idle preview map. Keep
-        // _lastFix so the "you are here" marker still tracks the user.
-        _track.clear();
-        _distanceMeters = 0;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _status = 'Failed to save run: $e');
-    }
-  }
-
   String _fmtDuration(Duration d) {
     final h = d.inHours;
     final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
     final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
     return h > 0 ? '$h:$m:$s' : '$m:$s';
-  }
-
-  // Recenter the map on [target] at the current zoom. Guarded: MapController
-  // .move throws if the map widget isn't mounted yet.
-  void _followCamera(LatLng target) {
-    try {
-      _mapController.move(target, _mapController.camera.zoom);
-    } catch (_) {
-      // Map not ready — the next fix or the initial fit will catch up.
-    }
-  }
-
-  // Recenter button: if the map has been panned away from the current
-  // location, recenter on it; if it's already centered, reset the bearing to
-  // north (handy after a two-finger rotate).
-  void _recenterOrAlignNorth() {
-    if (_lastFix == null) return;
-    final cam = _mapController.camera;
-    final offBy = Geolocator.distanceBetween(
-      cam.center.latitude,
-      cam.center.longitude,
-      _lastFix!.latitude,
-      _lastFix!.longitude,
-    );
-    if (offBy > 25) {
-      _mapController.move(
-        _lastFix!,
-        _recordMapZoom,
-      ); // recenter at default zoom
-      setState(() => _mapCentered = true);
-    } else {
-      _mapController.rotate(0); // already centered → align north-up
-      // Update state directly: a programmatic rotate doesn't reliably fire
-      // onPositionChanged, so the needle would otherwise stay tilted.
-      setState(() => _mapRotation = 0);
-    }
-  }
-
-  // Live location preview while on the Record tab and NOT recording, so the
-  // marker keeps tracking the user. Plain (non-foreground) stream: Android
-  // pauses it when the app is backgrounded, and we stop it when leaving the tab
-  // or when recording starts — so it isn't a battery sink.
-  Future<void> _startLocationPreview() async {
-    if (_recording || _previewSub != null) return;
-    if (!await _ensureLocationPermission()) return;
-    // State may have changed during the permission await.
-    if (!mounted ||
-        _recording ||
-        _previewSub != null ||
-        _pageIndex != _recordTabIndex) {
-      return;
-    }
-    _previewSub =
-        Geolocator.getPositionStream(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-            distanceFilter: 10,
-          ),
-        ).listen(
-          (pos) {
-            if (!mounted) return;
-            final fix = LatLng(pos.latitude, pos.longitude);
-            setState(() {
-              _lastFix = fix;
-              _gpsError = null; // a fix arrived — clear any prior preview error
-            });
-            // Follow only if centered, so panning the idle map isn't yanked back.
-            if (_mapCentered) _followCamera(fix);
-          },
-          // Don't swallow it: surface in the Record banner (and the dev console) so
-          // a broken preview doesn't sit on "Locating you…" forever.
-          onError: (e) {
-            debugPrint('[preview] GPS error: $e');
-            if (!mounted) return;
-            setState(() => _gpsError = 'GPS unavailable: $e');
-          },
-        );
-  }
-
-  void _stopLocationPreview() {
-    _previewSub?.cancel();
-    _previewSub = null;
   }
 
   Future<void> _signInWithGoogle() async {
@@ -2442,18 +2029,12 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       );
     }
 
-    // Debug builds: Home + Runs + dev-only tabs.
-    final titles = <String>[
-      'Chadwick XC Training',
-      'My Runs',
-      'Record Run',
-      'Debug Tools',
-    ];
+    // Debug builds: Home + Runs + Debug tools.
+    final titles = <String>['Chadwick XC Training', 'My Runs', 'Debug Tools'];
     final index = _pageIndex.clamp(0, titles.length - 1);
 
     // Build only the active page — building all of them every frame would
-    // re-run the Runs loaders on every setState (e.g. once per second while
-    // recording).
+    // re-run the Runs loaders on every setState.
     final Widget body;
     switch (index) {
       case 0:
@@ -2461,9 +2042,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         break;
       case 1:
         body = _buildHcRunsPage(theme);
-        break;
-      case 2:
-        body = _buildRecordPage(theme);
         break;
       default:
         body = _buildDebugPage(theme);
@@ -2479,12 +2057,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             _pageIndex = i;
             if (i == 1) _hcRunsFuture = _loadHcRuns(); // refresh on open
           });
-          // Run the idle location preview only while on the Record tab.
-          if (i == 2) {
-            _startLocationPreview();
-          } else {
-            _stopLocationPreview();
-          }
         },
         destinations: const [
           NavigationDestination(
@@ -2496,11 +2068,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             icon: Icon(Icons.directions_run_outlined),
             selectedIcon: Icon(Icons.directions_run),
             label: 'Runs',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.fiber_manual_record_outlined),
-            selectedIcon: Icon(Icons.fiber_manual_record),
-            label: 'Record',
           ),
           NavigationDestination(
             icon: Icon(Icons.bug_report_outlined),
@@ -2732,165 +2299,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
             Text(_status),
           ],
         ),
-      ),
-    );
-  }
-
-  // Full-screen Record page: live map with a follow marker, the growing path
-  // polyline, live stats, and the Start/Stop control.
-  // Smoothed polyline for the Record map, recomputed only when the track grows.
-  List<LatLng> _recordPolyline() {
-    if (_smoothedAtLength != _track.length) {
-      _smoothedAtLength = _track.length;
-      _smoothedTrack = smoothPath([
-        for (final p in _track) LatLng(p.lat, p.lng),
-      ]);
-    }
-    return _smoothedTrack;
-  }
-
-  Widget _buildRecordPage(ThemeData theme) {
-    final polyline = _recordPolyline();
-    final km = (_distanceMeters / 1000).toStringAsFixed(2);
-    // Show the compass whenever the map is centered on the user — the needle
-    // points straight up/down when aligned to north, and rotates to true north
-    // when the map is turned. The crosshair "recenter" icon shows only when the
-    // map has been panned off the current location.
-    final showCompass = _mapCentered;
-
-    return Stack(
-      children: [
-        FlutterMap(
-          mapController: _mapController,
-          options: MapOptions(
-            initialCenter: _lastFix ?? const LatLng(0, 0),
-            initialZoom: _recordMapZoom,
-            onPositionChanged: (camera, hasGesture) {
-              final centered = _lastFix == null
-                  ? true
-                  : Geolocator.distanceBetween(
-                          camera.center.latitude,
-                          camera.center.longitude,
-                          _lastFix!.latitude,
-                          _lastFix!.longitude,
-                        ) <=
-                        25;
-              if (camera.rotation != _mapRotation || centered != _mapCentered) {
-                setState(() {
-                  _mapRotation = camera.rotation;
-                  _mapCentered = centered;
-                });
-              }
-            },
-          ),
-          children: [
-            TileLayer(
-              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-              userAgentPackageName: 'com.github.briansp2020.xctraining',
-            ),
-            if (polyline.length >= 2)
-              PolylineLayer(
-                polylines: [
-                  Polyline(
-                    points: polyline,
-                    strokeWidth: 5,
-                    color: theme.colorScheme.primary,
-                  ),
-                ],
-              ),
-            if (_lastFix != null)
-              MarkerLayer(
-                markers: [
-                  Marker(
-                    point: _lastFix!,
-                    width: 22,
-                    height: 22,
-                    child: _locationDot(theme.colorScheme.primary),
-                  ),
-                ],
-              ),
-          ],
-        ),
-        if (_lastFix == null && !_recording)
-          Positioned(
-            top: 16,
-            left: 16,
-            right: 16,
-            child: Card(
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Text(_gpsError ?? 'Locating you…'),
-              ),
-            ),
-          ),
-        if (_recording)
-          Positioned(
-            top: 16,
-            left: 16,
-            right: 16,
-            child: Card(
-              color: theme.colorScheme.tertiaryContainer,
-              child: Padding(
-                padding: const EdgeInsets.symmetric(vertical: 12),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
-                  children: [
-                    _recordStat(theme, _fmtDuration(_elapsed), 'time'),
-                    _recordStat(theme, km, 'km'),
-                    _recordStat(theme, '${_track.length}', 'points'),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        if (_lastFix != null)
-          Positioned(
-            right: 16,
-            bottom: 88,
-            child: FloatingActionButton.small(
-              heroTag: 'recenter',
-              onPressed: _recenterOrAlignNorth,
-              tooltip: showCompass ? 'Align north' : 'Recenter on me',
-              child: showCompass
-                  ? _CompassNeedle(bearingDeg: _mapRotation)
-                  : const Icon(Icons.my_location),
-            ),
-          ),
-        Positioned(
-          left: 24,
-          right: 24,
-          bottom: 24,
-          child: _recording
-              ? FilledButton.icon(
-                  onPressed: _stopRecording,
-                  icon: const Icon(Icons.stop),
-                  label: const Text('Stop & Save'),
-                  style: FilledButton.styleFrom(
-                    minimumSize: const Size.fromHeight(52),
-                    backgroundColor: theme.colorScheme.error,
-                    foregroundColor: theme.colorScheme.onError,
-                  ),
-                )
-              : FilledButton.icon(
-                  onPressed: _startRecording,
-                  icon: const Icon(Icons.play_arrow),
-                  label: const Text('Start Run'),
-                  style: FilledButton.styleFrom(
-                    minimumSize: const Size.fromHeight(52),
-                  ),
-                ),
-        ),
-      ],
-    );
-  }
-
-  // A "you are here" dot for the map marker.
-  Widget _locationDot(Color color) {
-    return Container(
-      decoration: BoxDecoration(
-        color: color,
-        shape: BoxShape.circle,
-        border: Border.all(color: Colors.white, width: 3),
       ),
     );
   }
@@ -3216,20 +2624,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final ampm = d.hour < 12 ? 'AM' : 'PM';
     final min = d.minute.toString().padLeft(2, '0');
     return '${months[d.month - 1]} ${d.day}, ${d.year}  $h:$min $ampm';
-  }
-
-  Widget _recordStat(ThemeData theme, String value, String label) {
-    return Column(
-      children: [
-        Text(
-          value,
-          style: theme.textTheme.titleLarge?.copyWith(
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        Text(label, style: theme.textTheme.bodySmall),
-      ],
-    );
   }
 
   // Signed-in home: upload status front and center. The Sync button appears
