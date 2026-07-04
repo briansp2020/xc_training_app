@@ -6,6 +6,7 @@ import 'dart:ui' as ui; // Path is qualified to avoid latlong2's Path class
 
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show MethodChannel;
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
@@ -59,6 +60,10 @@ const Duration _firstSyncWindow = Duration(days: 30);
 // server, so Sync only sends new ones. (Server dedup is idempotent anyway; this
 // just avoids re-POSTing every track on every sync.)
 const String _uploadedRoutesPrefsKey = 'uploaded_route_files';
+
+// shared_preferences key — Health Connect route ids (workout uuid) already
+// uploaded to the server, so Sync only sends new ones.
+const String _uploadedHcRoutesPrefsKey = 'uploaded_hc_routes';
 
 // Re-query an overlap behind the watermark on every incremental sync, to catch
 // late-arriving Health Connect samples. The watermark is a single global max
@@ -304,6 +309,11 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
+  // Native bridge for Health Connect's route-consent dialogs (MainActivity.kt).
+  // The health plugin can't request route access — see _grantRouteAccess.
+  static const MethodChannel _routeAccess =
+      MethodChannel('xctraining/route_access');
+
   final Health _health = Health();
   final AuthService _auth = AuthService(
     serverBase: _serverBase,
@@ -368,6 +378,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     HealthDataType.HEART_RATE,
     HealthDataType.STEPS,
     HealthDataType.DISTANCE_DELTA,
+    // GPS routes attached to other apps' workouts (Fitbit / Pixel Watch runs).
+    // Must be requested together with WORKOUT. Reading routes OTHER apps wrote
+    // additionally needs "Exercise routes → Always allow" in Health Connect's
+    // app permissions; until granted they read back empty (ConsentRequired).
+    HealthDataType.WORKOUT_ROUTE,
     HealthDataType.ACTIVE_ENERGY_BURNED,
     // TOTAL_CALORIES_BURNED is required even though we never directly read
     // it via this list: the health package's WORKOUT reader internally
@@ -495,10 +510,17 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _posSub = Geolocator.getPositionStream(locationSettings: settings).listen(
         (pos) {
           if (!mounted) return;
-          // Drop low-quality fixes — a poor-accuracy fix scatters the path and
-          // its out-and-back leg inflates the recorded distance.
-          if (pos.accuracy > _gpsAccuracyThresholdM) return;
           final fix = LatLng(pos.latitude, pos.longitude);
+          // Don't RECORD low-quality fixes — a poor-accuracy fix scatters the
+          // path and its out-and-back leg inflates the distance — but do keep
+          // the marker/camera live so the map doesn't freeze in weak GPS. (A
+          // poor fix is roughly right, just imprecise; jump spikes below are
+          // wrong positions, so those don't move the marker either.)
+          if (pos.accuracy > _gpsAccuracyThresholdM) {
+            setState(() => _lastFix = fix);
+            _followCamera(fix);
+            return;
+          }
           double? leg;
           if (_track.isNotEmpty) {
             final last = _track.last;
@@ -1359,9 +1381,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         numericTotal += samples.length;
         for (var i = 0; i < samples.length; i++) {
           if (i % 200 == 0) {
+            if (!mounted) return;
             setState(() => _status =
                 'Importing ${entry.key} ${i + 1}/${samples.length}...');
-            if (!mounted) return;
           }
           final s = samples[i];
           try {
@@ -1394,9 +1416,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         intervalTotal += samples.length;
         for (var i = 0; i < samples.length; i++) {
           if (i % 100 == 0) {
+            if (!mounted) return;
             setState(() => _status =
                 'Importing ${entry.key} ${i + 1}/${samples.length}...');
-            if (!mounted) return;
           }
           final s = samples[i];
           try {
@@ -1728,18 +1750,42 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         return;
       }
 
-      final routeMsg = (routes.uploaded == 0 && routes.failed == 0)
+      // ...and any GPS routes other apps attached to their workouts in
+      // Health Connect (Fitbit / Pixel Watch runs).
+      setState(() => _status = 'Uploading Health Connect routes...');
+      final hcRoutes =
+          await _uploadHealthConnectRoutes(prefs, windowStart, now);
+      if (!mounted) return;
+      if (hcRoutes.unauthorized) {
+        await _auth.invalidate();
+        if (!mounted) return;
+        setState(() {
+          _uploading = false;
+          _status = 'Sign-in expired. Please sign in again, then re-tap Sync.';
+        });
+        return;
+      }
+
+      final routesUploaded = routes.uploaded + hcRoutes.uploaded;
+      final routesFailed = routes.failed + hcRoutes.failed;
+      final routeMsg = (routesUploaded == 0 && routesFailed == 0)
           ? ' No new routes.'
-          : ' Routes: ${routes.uploaded} uploaded'
-              '${routes.failed > 0 ? ", ${routes.failed} failed" : ""}.';
+          : ' Routes: $routesUploaded uploaded'
+              '${hcRoutes.uploaded > 0 ? " (${hcRoutes.uploaded} from Health Connect)" : ""}'
+              '${routesFailed > 0 ? ", $routesFailed failed" : ""}.';
+      final consentMsg = hcRoutes.pendingConsent > 0
+          ? '\n${hcRoutes.pendingConsent} Health Connect route(s) unreadable — '
+              'grant "Exercise routes → Always allow" in Health Connect → '
+              'App permissions → XC Training Data, then Sync again.'
+          : '';
       setState(() {
         _uploading = false;
         if (ok) {
           _status =
-              'Synced $sizeMB MB ($windowLabel): $workoutCount workouts, $totalSamples samples. Server: ${response.statusCode}.$routeMsg';
+              'Synced $sizeMB MB ($windowLabel): $workoutCount workouts, $totalSamples samples. Server: ${response.statusCode}.$routeMsg$consentMsg';
         } else {
           _status =
-              'Health upload failed: ${response.statusCode}.$routeMsg\n${response.body}';
+              'Health upload failed: ${response.statusCode}.$routeMsg$consentMsg\n${response.body}';
         }
       });
     } catch (e) {
@@ -1797,6 +1843,152 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     return (uploaded: uploaded, failed: failed, unauthorized: false);
   }
 
+  // Uploads GPS routes that OTHER apps (Fitbit, Pixel Watch, ...) attached to
+  // their Health Connect workouts, as route_track payloads to POST /routes.
+  // Routes the user hasn't consented to yet read back with no locations
+  // (ConsentRequired) — counted in pendingConsent so the status can tell the
+  // user to grant "Exercise routes" in Health Connect's app permissions.
+  Future<({int uploaded, int failed, int pendingConsent, bool unauthorized})>
+      _uploadHealthConnectRoutes(
+          SharedPreferences prefs, DateTime windowStart, DateTime now) async {
+    final points =
+        await _safeRead(HealthDataType.WORKOUT_ROUTE, windowStart, now);
+    final done = (prefs.getStringList(_uploadedHcRoutesPrefsKey) ?? []).toSet();
+    var uploaded = 0;
+    var failed = 0;
+    var pendingConsent = 0;
+    for (final r in points) {
+      final v = r.value;
+      if (v is! WorkoutRouteHealthValue) continue;
+      // The workout uuid is the stable identity of the route (and what the
+      // server can join against the workouts table); fall back to the record
+      // uuid if the package didn't surface it.
+      final id = v.workoutUuid ?? r.uuid;
+      if (done.contains(id)) continue;
+      if (v.locations.isEmpty) {
+        pendingConsent++;
+        continue;
+      }
+      final locs = v.locations;
+      var dist = 0.0;
+      for (var i = 1; i < locs.length; i++) {
+        dist += Geolocator.distanceBetween(
+            locs[i - 1].latitude,
+            locs[i - 1].longitude,
+            locs[i].latitude,
+            locs[i].longitude);
+      }
+      final payload = {
+        'type': 'route_track',
+        'client_route_id': id,
+        'source': 'health_connect',
+        'source_workout_uuid': v.workoutUuid,
+        'recorded_at': now.toUtc().toIso8601String(),
+        'start_time': r.dateFrom.toUtc().toIso8601String(),
+        'end_time': r.dateTo.toUtc().toIso8601String(),
+        'duration_seconds': r.dateTo.difference(r.dateFrom).inSeconds,
+        'distance_meters': dist,
+        'point_count': locs.length,
+        'points': [
+          for (final p in locs)
+            {
+              'lat': p.latitude,
+              'lng': p.longitude,
+              'time': p.timestamp.toUtc().toIso8601String(),
+              'accuracy_m': p.horizontalAccuracy,
+              'altitude_m': p.altitude,
+              'speed_mps': p.speed, // null on Android — HC routes omit speed
+            }
+        ],
+      };
+      try {
+        final resp = await http
+            .post(
+              Uri.parse('$_serverBase/routes'),
+              headers: {
+                'Content-Type': 'application/json',
+                ..._auth.authHeaders,
+              },
+              body: jsonEncode(payload),
+            )
+            .timeout(const Duration(seconds: 60));
+        if (resp.statusCode == 401) {
+          await prefs.setStringList(_uploadedHcRoutesPrefsKey, done.toList());
+          return (
+            uploaded: uploaded,
+            failed: failed,
+            pendingConsent: pendingConsent,
+            unauthorized: true,
+          );
+        }
+        if (resp.statusCode >= 200 && resp.statusCode < 300) {
+          done.add(id);
+          uploaded++;
+        } else {
+          debugPrint(
+              '[hc-routes] $id rejected: ${resp.statusCode} ${resp.body}');
+          failed++;
+        }
+      } catch (e) {
+        debugPrint('[hc-routes] upload of $id failed: $e');
+        failed++; // network/timeout — retried next sync
+      }
+    }
+    await prefs.setStringList(_uploadedHcRoutesPrefsKey, done.toList());
+    return (
+      uploaded: uploaded,
+      failed: failed,
+      pendingConsent: pendingConsent,
+      unauthorized: false,
+    );
+  }
+
+  // Debug: obtain Health Connect route access via the native dialogs. Tries
+  // the blanket "Exercise routes" permission first (Android 15+); if that's
+  // unavailable or denied, falls back to the per-route consent dialog for the
+  // first consent-blocked route (its "Allow all" option covers future runs).
+  Future<void> _grantRouteAccess() async {
+    setState(() => _status = 'Requesting Health Connect route access...');
+    try {
+      final blanket =
+          await _routeAccess.invokeMethod<bool>('requestRoutesPermission');
+      if (!mounted) return;
+      if (blanket == true) {
+        setState(() => _status =
+            'Exercise-routes permission granted. Tap Sync to upload routes.');
+        return;
+      }
+      // Fall back to per-route consent for the first blocked route.
+      final now = DateTime.now();
+      final points = await _safeRead(HealthDataType.WORKOUT_ROUTE,
+          now.subtract(const Duration(days: 30)), now);
+      if (!mounted) return;
+      String? uuid;
+      for (final p in points) {
+        final v = p.value;
+        if (v is WorkoutRouteHealthValue && v.locations.isEmpty) {
+          uuid = v.workoutUuid ?? p.uuid;
+          break;
+        }
+      }
+      if (uuid == null) {
+        setState(() => _status =
+            'No consent-blocked routes found in the last 30 days.');
+        return;
+      }
+      final ok = await _routeAccess
+          .invokeMethod<bool>('requestRouteConsent', {'sessionUuid': uuid});
+      if (!mounted) return;
+      setState(() => _status = ok == true
+          ? 'Route consent granted — pick "Allow all" next time to cover '
+              'future runs automatically. Tap Sync to upload.'
+          : 'Route consent denied.');
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _status = 'Route access request failed: $e');
+    }
+  }
+
   // Debug: rewind the health sync watermark 24h AND clear the route-upload
   // tracking, so the next Sync re-uploads the last day of health data plus all
   // saved route tracks (server dedup makes both re-uploads idempotent).
@@ -1805,6 +1997,7 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     final t = DateTime.now().subtract(const Duration(hours: 24));
     await prefs.setString(_lastSyncPrefsKey, t.toUtc().toIso8601String());
     await prefs.remove(_uploadedRoutesPrefsKey); // re-send saved routes too
+    await prefs.remove(_uploadedHcRoutesPrefsKey); // and Health Connect routes
     if (!mounted) return;
     setState(() => _status =
         'Reset: health watermark −24h and route-upload tracking cleared. '
@@ -2393,6 +2586,9 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           // Independent of health permissions — just rewinds the sync watermark.
           debugButton(Icons.history, 'Reset Sync (-24h + routes)',
               _resetSyncWatermark),
+          const SizedBox(height: 8),
+          debugButton(Icons.route, 'Grant HC Route Access',
+              _grantRouteAccess),
           const SizedBox(height: 8),
           if (_permissionsGranted) ...[
             debugButton(

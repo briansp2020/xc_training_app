@@ -34,6 +34,12 @@ android {
     }
 }
 
+dependencies {
+    // MainActivity fires Health Connect's route-consent dialogs directly —
+    // the health plugin only pulls this in transitively (not compile-visible).
+    implementation("androidx.health.connect:connect-client:1.1.0")
+}
+
 kotlin {
     compilerOptions {
         jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
