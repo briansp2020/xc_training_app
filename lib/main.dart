@@ -69,6 +69,12 @@ const String _uploadedHcRoutesPrefsKey = 'uploaded_hc_routes';
 const String _routeAccessDonePrefsKey = 'route_access_done';
 const String _autoSyncPrefsKey = 'auto_sync_enabled';
 
+// shared_preferences key — iOS only: the health permission sheet has been
+// shown and accepted. HealthKit never discloses READ-grant status (the
+// plugin's hasPermissions returns null for reads), so without this flag every
+// cold launch would treat permissions as missing and re-show onboarding.
+const String _healthPermsRequestedPrefsKey = 'health_perms_requested';
+
 // Re-query an overlap behind the watermark on every incremental sync, to catch
 // late-arriving Health Connect samples. The watermark is a single global max
 // across all streams, so live HR pins it near "now"; but Fitbit derives resting
@@ -789,10 +795,19 @@ class _HomeScreenState extends State<HomeScreen> {
         _types,
         permissions: _permissions,
       );
+      // HealthKit never discloses READ-grant status, so on iOS hasPermissions
+      // is always null for our read-only types. Fall back to "the permission
+      // sheet was accepted once" persisted at request time — otherwise every
+      // cold launch re-shows onboarding.
+      var granted = hasPermissions ?? false;
+      if (!granted && Platform.isIOS) {
+        final prefs = await SharedPreferences.getInstance();
+        granted = prefs.getBool(_healthPermsRequestedPrefsKey) ?? false;
+      }
       if (!mounted) return;
 
       setState(() {
-        _permissionsGranted = hasPermissions ?? false;
+        _permissionsGranted = granted;
         _status = _permissionsGranted
             ? 'Permissions granted. Ready to read data!'
             : 'Tap "Request Permissions" to get started.';
@@ -818,6 +833,12 @@ class _HomeScreenState extends State<HomeScreen> {
         _types,
         permissions: _permissions,
       );
+      if (requested && Platform.isIOS) {
+        // Remember the grant — hasPermissions can't detect it on iOS (see
+        // _checkPermissions).
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setBool(_healthPermsRequestedPrefsKey, true);
+      }
       if (!mounted) return;
 
       setState(() {
