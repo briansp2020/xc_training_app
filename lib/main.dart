@@ -530,6 +530,16 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _refreshPendingData() async {
     if (!_onboarded || !_auth.isSignedIn) return;
     setState(() => _pendingSamples = null); // check in progress
+    // Fail fast on a down server instead of hanging the 30s watermark fetch.
+    if (!await _serverReachable()) {
+      if (!mounted) return;
+      setState(() {
+        _pendingSamples = -2; // server unreachable
+        _lastSyncAt = null;
+        _status = 'Server unreachable at $_serverBase.';
+      });
+      return;
+    }
     final DateTime? last;
     try {
       last = await _fetchServerWatermark();
@@ -1613,11 +1623,43 @@ class _HomeScreenState extends State<HomeScreen> {
   // _historyWindow. Safe to repeat — the server's composite-key upsert
   // dedups everything; the payload carries "backfill": true so the server
   // can tell this overlap is deliberate.
+  // Quick liveness probe so a down/unreachable server fails in ~5s with a
+  // clear message, instead of hanging the full 120s upload timeout on a dead
+  // connection. Any HTTP response (even 404) means the server answered; only a
+  // socket error or the short timeout counts as unreachable.
+  Future<bool> _serverReachable() async {
+    try {
+      await http
+          .get(Uri.parse('$_serverBase/'))
+          .timeout(const Duration(seconds: 5));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   Future<void> _syncHealthData({bool backfill = false}) async {
     setState(() {
       _uploading = true;
-      _status = 'Reading data from Health Connect...';
+      _status = 'Checking server...';
     });
+
+    // Fail fast when the server is down instead of hanging on the upload.
+    if (!await _serverReachable()) {
+      if (!mounted) return;
+      setState(() {
+        _uploading = false;
+        // Drive the home status to the "unreachable" line; otherwise it falls
+        // back to the stale _pendingSamples value ("Checking for new data…").
+        _pendingSamples = -2;
+        _status =
+            'Server unreachable at $_serverBase.\n'
+            'Check it is running and on the same network, then re-tap Sync.';
+      });
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _status = 'Reading data from Health Connect...');
 
     try {
       final prefs = await SharedPreferences.getInstance();
