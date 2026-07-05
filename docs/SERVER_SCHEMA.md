@@ -293,7 +293,34 @@ INSERT INTO interval_samples (uuid, stream, start_time, ...) VALUES (...)
 ON CONFLICT (uuid, stream, start_time) DO UPDATE SET value = EXCLUDED.value, ...;
 ```
 
-Re-uploads with the same keys idempotently update. The client syncs incrementally: it tracks the newest `dateTo` of any record it uploaded as a watermark in `shared_preferences`, then on the next sync re-queries `[watermark - 24 hours, now]`. The 24-hour overlap re-reads the tail of the previous window so Health Connect inserts that arrive late still get captured — Fitbit batches HR 30–60 minutes after the fact, and derives resting HR, HRV, and sleep from overnight data delivered hours late — and your composite-key dedup is what makes that overlap free. Empty syncs (no new records) leave the watermark alone, so the next attempt re-queries the same window. First-run / post-reinstall syncs fall back to a 24-hour window.
+Re-uploads with the same keys idempotently update. The client syncs incrementally, and **the server owns the watermark**: before each sync the client calls `GET /me/last-sample-time` (below) and re-queries `[watermark - 24 hours, now]`. The 24-hour overlap re-reads the tail of the previous window so Health Connect inserts that arrive late still get captured — Fitbit batches HR 30–60 minutes after the fact, and derives resting HR, HRV, and sleep from overnight data delivered hours late — and your composite-key dedup is what makes that overlap free. When the server has no data for the athlete (first sync, or right after `DELETE /me/data`), the client uploads the last 24 hours.
+
+### Sync watermark: `GET /me/last-sample-time`
+
+Returns the newest sample timestamp the server has stored for the authenticated athlete, across **all** ingested tables (workouts, numeric samples, interval samples). This replaces the client-side watermark: a reinstall or a second device automatically resumes where the athlete's data actually ends.
+
+```
+GET /me/last-sample-time
+Authorization: Bearer <jwt>
+→ 200 { "last_sample_time": "2026-07-04T21:18:30Z" }   // ISO-8601 UTC
+→ 200 { "last_sample_time": null }                      // no data yet
+```
+
+The value must be the max of the *end* timestamps (`end_time` for workouts and interval samples, the sample `time` for numeric streams) — the same quantity the client previously tracked. FastAPI sketch:
+
+```python
+@app.get("/me/last-sample-time")
+def last_sample_time(athlete=Depends(current_athlete)):
+    times = [
+        db.scalar(select(func.max(Workout.end_time)).where(Workout.athlete_id == athlete.id)),
+        db.scalar(select(func.max(NumericSample.time)).where(NumericSample.athlete_id == athlete.id)),
+        db.scalar(select(func.max(IntervalSample.end_time)).where(IntervalSample.athlete_id == athlete.id)),
+    ]
+    newest = max((t for t in times if t is not None), default=None)
+    return {"last_sample_time": newest.isoformat() if newest else None}
+```
+
+Performance note: this endpoint is hit at the start of every sync **and** every time the home screen recomputes its status, so the `MAX()` on the one large table (heart-rate samples) must be an index-only seek — it needs an `(athlete_id, time)` index. Small tables (workouts, interval samples) can just scan. Streams the server doesn't persist in queryable tables simply don't contribute, which is fine: live HR densely tracks the true data end, and the client's 24-hour re-query overlap is what catches late-arriving derived data (resting HR, HRV, sleep) regardless. A watermark that under-reports only causes some re-upload, which the composite-key dedup absorbs; it can never create a gap.
 
 ---
 
@@ -634,9 +661,11 @@ uploaded**: workouts, every raw sample stream, detected sessions, and route
 tracks. The athlete comes from the Bearer token like every other endpoint.
 
 The app's debug **Reset (wipe server + start over)** button calls this and,
-only after a 2xx, clears its local sync state (watermark + route-upload
-dedup) — so the next Sync re-uploads the full first-sync window and every
-saved route from scratch.
+only after a 2xx, clears its local route-upload dedup list. The sync
+watermark needs no clearing — it lives on the server (`GET
+/me/last-sample-time`) and deleting the data resets it to `null`
+automatically, so the next Sync re-uploads the full first-sync window and
+every route from scratch.
 
 No body, no query params. Responses:
 

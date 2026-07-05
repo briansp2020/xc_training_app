@@ -47,10 +47,11 @@ const int _athleteId = 1;
 // it. Must match `version` in pubspec.yaml — bump both together.
 const String _clientVersion = '1.0.0+1';
 
-// shared_preferences key — stores the ISO-8601 UTC timestamp of the most
-// recent successful sync. Next sync uses this as window_start. Falls back to
-// 24 hours ago when absent (first run or after a reinstall).
-const String _lastSyncPrefsKey = 'last_sync_at';
+// When the server has no data for this athlete yet, the first sync uploads
+// this much history. Afterwards each sync asks the server for the newest
+// sample it has (GET /me/last-sample-time) and uploads from there — the
+// server is the single source of truth, so reinstalls and second devices
+// resume where the data actually ends.
 const Duration _firstSyncWindow = Duration(hours: 24);
 
 // How far back the Runs tab and the debug export look. Deliberately wider
@@ -407,8 +408,9 @@ class _HomeScreenState extends State<HomeScreen> {
   bool get _onboarded =>
       _permissionsGranted && _routeAccessDone && _autoSyncEnabled != null;
 
-  // Home-page upload status: samples in the core streams newer than the sync
-  // watermark. null = check in progress; -1 = never synced.
+  // Home-page upload status: samples in the core streams newer than the
+  // server's watermark. null = check in progress; -1 = never synced;
+  // -2 = server unreachable.
   int? _pendingSamples;
   DateTime? _lastSyncAt;
 
@@ -499,23 +501,55 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  // Asks the server for the newest sample timestamp it has for this athlete
+  // (GET /me/last-sample-time) — the sync watermark. Returns null when the
+  // server has no data yet (first sync, or right after a data reset). Throws
+  // on any failure; a 401 also drops the token so the sign-in card returns.
+  Future<DateTime?> _fetchServerWatermark() async {
+    final resp = await http
+        .get(
+          Uri.parse('$_serverBase/me/last-sample-time'),
+          headers: _auth.authHeaders,
+        )
+        .timeout(const Duration(seconds: 30));
+    if (resp.statusCode == 401) {
+      await _auth.invalidate();
+      throw Exception('Sign-in expired. Please sign in again.');
+    }
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      throw Exception('Server returned ${resp.statusCode}');
+    }
+    final t =
+        (jsonDecode(resp.body) as Map<String, dynamic>)['last_sample_time'];
+    return t == null ? null : DateTime.parse(t as String).toLocal();
+  }
+
   // Recomputes the home page's upload status: how many samples in the core
-  // streams are newer than the sync watermark. HR trickles in continuously,
-  // so any nonzero count shows the Sync button.
+  // streams are newer than the server's watermark. HR trickles in
+  // continuously, so any nonzero count shows the Sync button.
   Future<void> _refreshPendingData() async {
     if (!_onboarded || !_auth.isSignedIn) return;
     setState(() => _pendingSamples = null); // check in progress
-    final prefs = await SharedPreferences.getInstance();
+    final DateTime? last;
+    try {
+      last = await _fetchServerWatermark();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _pendingSamples = -2; // server unreachable
+        _lastSyncAt = null;
+        _status = 'Could not check the server: $e';
+      });
+      return;
+    }
     if (!mounted) return;
-    final lastIso = prefs.getString(_lastSyncPrefsKey);
-    if (lastIso == null) {
+    if (last == null) {
       setState(() {
         _pendingSamples = -1; // never synced
         _lastSyncAt = null;
       });
       return;
     }
-    final last = DateTime.parse(lastIso);
     final now = DateTime.now();
     var count = 0;
     for (final t in [
@@ -528,7 +562,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     setState(() {
       _pendingSamples = count;
-      _lastSyncAt = last.toLocal();
+      _lastSyncAt = last!.toLocal();
     });
   }
 
@@ -1519,28 +1553,14 @@ class _HomeScreenState extends State<HomeScreen> {
   /// getHealthDataFromTypes call makes the health plugin serialize the whole
   /// result across the method channel in one allocation, and a full window of
   /// ~165k HR samples OOMs the Java heap.
-  Future<
-    ({Map<String, dynamic> payload, int totalSamples, DateTime? maxSampleTime})
-  >
-  _buildSyncPayload(
+  Future<({Map<String, dynamic> payload, int totalSamples})> _buildSyncPayload(
     DateTime windowStart,
     DateTime now, {
     String labelSuffix = '',
   }) async {
-    // Newest dateTo across everything we read — becomes the sync watermark.
-    DateTime? maxSampleTime;
-    void trackMax(DateTime t) {
-      if (maxSampleTime == null || t.isAfter(maxSampleTime!)) {
-        maxSampleTime = t;
-      }
-    }
-
     // Workouts use the package's special WORKOUT path (it aggregates
     // distance/calories/steps from related records). Separate read.
     final workouts = await _safeRead(HealthDataType.WORKOUT, windowStart, now);
-    for (final w in workouts) {
-      trackMax(w.dateTo);
-    }
 
     final workoutPayloads = workouts.map((w) {
       final wv = w.value is WorkoutHealthValue
@@ -1576,27 +1596,17 @@ class _HomeScreenState extends State<HomeScreen> {
     for (final e in _numericStreams.entries) {
       if (mounted) setState(() => _status = 'Reading ${e.key}$labelSuffix...');
       final samples = await _safeRead(e.value, windowStart, now);
-      for (final s in samples) {
-        trackMax(s.dateTo);
-      }
       payload[e.key] = samples.map(_numericSample).toList();
       totalSamples += samples.length;
     }
     for (final e in _intervalStreams.entries) {
       if (mounted) setState(() => _status = 'Reading ${e.key}$labelSuffix...');
       final samples = await _safeRead(e.value, windowStart, now);
-      for (final s in samples) {
-        trackMax(s.dateTo);
-      }
       payload[e.key] = samples.map(_intervalSample).toList();
       totalSamples += samples.length;
     }
 
-    return (
-      payload: payload,
-      totalSamples: totalSamples,
-      maxSampleTime: maxSampleTime,
-    );
+    return (payload: payload, totalSamples: totalSamples);
   }
 
   Future<void> _syncHealthData() async {
@@ -1608,13 +1618,16 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final prefs = await SharedPreferences.getInstance();
       if (!mounted) return;
-      final lastSyncIso = prefs.getString(_lastSyncPrefsKey);
+      setState(() => _status = 'Checking what the server already has...');
+      final serverWatermark = await _fetchServerWatermark();
+      if (!mounted) return;
+      setState(() => _status = 'Reading data from Health Connect...');
       final now = DateTime.now();
-      final windowStart = lastSyncIso != null
-          ? DateTime.parse(lastSyncIso).subtract(_watermarkOverlap)
+      final windowStart = serverWatermark != null
+          ? serverWatermark.subtract(_watermarkOverlap)
           : now.subtract(_firstSyncWindow);
       final windowDays = now.difference(windowStart).inMinutes / (60 * 24);
-      final windowLabel = lastSyncIso != null
+      final windowLabel = serverWatermark != null
           ? 'since last sync (${windowDays.toStringAsFixed(1)} days)'
           : 'full ${_firstSyncWindow.inHours}-hour window (first sync)';
 
@@ -1622,7 +1635,6 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
       final payload = built.payload;
       final totalSamples = built.totalSamples;
-      final maxSampleTime = built.maxSampleTime;
       final workoutCount = (payload['workouts'] as List).length;
 
       final bodyBytes = utf8.encode(jsonEncode(payload));
@@ -1642,17 +1654,8 @@ class _HomeScreenState extends State<HomeScreen> {
       if (!mounted) return;
 
       final ok = response.statusCode >= 200 && response.statusCode < 300;
-      if (ok && maxSampleTime != null) {
-        // Only advance the watermark on a successful 2xx AND when we
-        // actually uploaded something. If the sync was empty, leave the
-        // watermark alone so the next sync re-queries the same window —
-        // that way delayed Health Connect inserts can still be picked up.
-        await prefs.setString(
-          _lastSyncPrefsKey,
-          maxSampleTime.toUtc().toIso8601String(),
-        );
-        if (!mounted) return;
-      }
+      // No watermark to persist — the server derives it from the data it
+      // just ingested, and the next sync asks for it again.
 
       // 401 → token rejected. Drop it so the next sync attempt forces
       // sign-in, and show the auth card again instead of a noisy error.
@@ -1900,10 +1903,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // Debug: full start-over. Asks the server to delete EVERYTHING this athlete
   // has uploaded (DELETE /me/data — see SERVER_SCHEMA.md "Data reset"), then
-  // clears all local sync state (watermark + route-upload dedup) so the next
-  // Sync re-uploads the full first-sync window and every route from scratch.
-  // Local state is only cleared after the server wipe succeeds, so a failed
-  // wipe can simply be retried.
+  // clears the local route-upload dedup list so the next Sync re-uploads the
+  // full first-sync window and every route from scratch. (The sync watermark
+  // lives on the server and resets with the data.) Local state is only
+  // cleared after the server wipe succeeds, so a failed wipe can be retried.
   Future<void> _resetSyncWatermark() async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -1962,8 +1965,9 @@ class _HomeScreenState extends State<HomeScreen> {
         });
         return;
       }
+      // The sync watermark lives on the server and was just deleted with the
+      // data; only the local route-dedup list needs clearing.
       final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(_lastSyncPrefsKey);
       await prefs.remove(_uploadedHcRoutesPrefsKey);
       if (!mounted) return;
       setState(() {
@@ -2594,10 +2598,14 @@ class _HomeScreenState extends State<HomeScreen> {
     } else if (pending == null) {
       statusIcon = Icons.cloud_queue;
       statusLine = 'Checking for new data…';
+    } else if (pending == -2) {
+      statusIcon = Icons.cloud_off;
+      statusLine = 'Could not reach the server — tap Sync to retry.';
     } else if (pending == -1) {
       statusIcon = Icons.cloud_off;
       statusLine =
-          'Nothing uploaded yet — tap Sync to upload your last 30 days.';
+          'Nothing uploaded yet — tap Sync to upload your last '
+          '${_firstSyncWindow.inHours} hours.';
     } else if (pending == 0) {
       statusIcon = Icons.cloud_done;
       statusLine = 'All data uploaded.';
