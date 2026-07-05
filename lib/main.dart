@@ -521,7 +521,12 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!mounted) return;
     setState(() {
       _authLoading = false;
-      _routeAccessDone = prefs.getBool(_routeAccessDonePrefsKey) ?? false;
+      // HealthKit grants workout-route reading through the standard health
+      // permission — there's no separate route consent like Health Connect's,
+      // and the xctraining/route_access channel is Android-only. So on iOS the
+      // route step is always satisfied; skip it.
+      _routeAccessDone =
+          Platform.isIOS || (prefs.getBool(_routeAccessDonePrefsKey) ?? false);
       _autoSyncEnabled = prefs.containsKey(_autoSyncPrefsKey)
           ? prefs.getBool(_autoSyncPrefsKey)
           : null;
@@ -1934,6 +1939,13 @@ class _HomeScreenState extends State<HomeScreen> {
   // back to the per-route consent dialog for the first consent-blocked route
   // (its "Allow all" option covers future runs).
   Future<void> _grantRouteAccess() async {
+    // iOS has no separate route consent — HealthKit's standard permission
+    // covers workout routes, and the route_access channel is Android-only.
+    if (Platform.isIOS) {
+      setState(() => _status = 'Route access is granted via Health on iOS.');
+      await _markRouteAccessDone();
+      return;
+    }
     setState(() => _status = 'Requesting Health Connect route access...');
     try {
       final blanket = await _routeAccess.invokeMethod<bool>(
@@ -2334,7 +2346,9 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
             const SizedBox(height: 8),
             Text(
-              'Three quick steps so your training data reaches the team.',
+              Platform.isIOS
+                  ? 'Two quick steps so your training data reaches the team.'
+                  : 'Three quick steps so your training data reaches the team.',
               style: theme.textTheme.bodyMedium,
             ),
             const SizedBox(height: 16),
@@ -2347,13 +2361,22 @@ class _HomeScreenState extends State<HomeScreen> {
                     _permissionsGranted,
                     healthActive,
                   ),
+                  // Health Connect needs a separate route-consent step;
+                  // HealthKit covers routes with the standard permission, so
+                  // this step doesn't exist on iOS.
+                  if (!Platform.isIOS)
+                    step(
+                      2,
+                      'Allow workout route access',
+                      _routeAccessDone,
+                      routeActive,
+                    ),
                   step(
-                    2,
-                    'Allow workout route access',
-                    _routeAccessDone,
-                    routeActive,
+                    Platform.isIOS ? 2 : 3,
+                    'Choose automatic upload',
+                    autoDone,
+                    autoActive,
                   ),
-                  step(3, 'Choose automatic upload', autoDone, autoActive),
                 ],
               ),
             ),
