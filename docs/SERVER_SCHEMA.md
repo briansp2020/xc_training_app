@@ -2,7 +2,7 @@
 
 This document describes the JSON payload the **XC Training Data** mobile app POSTs to the analysis server.
 
-The intent is to ship **as much raw data as Health Connect (Android) or HealthKit (iOS) exposes** over a 30-day window, so the server can derive everything — including **detecting exercise sessions from raw HR + step streams** when the recording app (Fitbit, etc.) failed to wrap them in an `ExerciseSessionRecord`.
+The intent is to ship **as much raw data as Health Connect (Android) or HealthKit (iOS) exposes** over the sync window (24 hours on first sync, incremental afterwards), so the server can derive everything — including **detecting exercise sessions from raw HR + step streams** when the recording app (Fitbit, etc.) failed to wrap them in an `ExerciseSessionRecord`.
 
 The client is a thin uploader. It does **not** aggregate, smooth, classify, or compute derived metrics. All of that happens server-side.
 
@@ -135,7 +135,7 @@ Serialized JSON: **~15 MB per athlete per sync**. Plan for this in your reverse 
 | `client_version` | string | App version. |
 | `uploaded_at` | ISO-8601 UTC | When the client built the payload. |
 | `source_platform` | string | `"googleHealthConnect"` (Android) or `"appleHealthKit"` (iOS, future). |
-| `window_start` / `window_end` | ISO-8601 UTC | The time range the client queried. Currently **last 30 days**. |
+| `window_start` / `window_end` | ISO-8601 UTC | The time range the client queried. **Last 24 hours** on first sync; since-watermark afterwards. |
 | `workouts` | array | Explicit exercise sessions the recording app wrote. May be empty. |
 | `*_samples` / `*_sessions` arrays | array | All raw samples in `[window_start, window_end]`. Empty array if the type had no data or wasn't permissioned. |
 
@@ -293,7 +293,7 @@ INSERT INTO interval_samples (uuid, stream, start_time, ...) VALUES (...)
 ON CONFLICT (uuid, stream, start_time) DO UPDATE SET value = EXCLUDED.value, ...;
 ```
 
-Re-uploads with the same keys idempotently update. The client syncs incrementally: it tracks the newest `dateTo` of any record it uploaded as a watermark in `shared_preferences`, then on the next sync re-queries `[watermark - 1 hour, now]`. The 1-hour overlap re-reads the tail of the previous window so Health Connect inserts that arrive late (e.g. Fitbit batching HR 30–60 minutes after the fact) still get captured — and your composite-key dedup is what makes that overlap free. Empty syncs (no new records) leave the watermark alone, so the next attempt re-queries the same window. First-run / post-reinstall syncs fall back to a 30-day window.
+Re-uploads with the same keys idempotently update. The client syncs incrementally: it tracks the newest `dateTo` of any record it uploaded as a watermark in `shared_preferences`, then on the next sync re-queries `[watermark - 24 hours, now]`. The 24-hour overlap re-reads the tail of the previous window so Health Connect inserts that arrive late still get captured — Fitbit batches HR 30–60 minutes after the fact, and derives resting HR, HRV, and sleep from overnight data delivered hours late — and your composite-key dedup is what makes that overlap free. Empty syncs (no new records) leave the watermark alone, so the next attempt re-queries the same window. First-run / post-reinstall syncs fall back to a 24-hour window.
 
 ---
 

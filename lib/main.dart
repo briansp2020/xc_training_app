@@ -49,9 +49,14 @@ const String _clientVersion = '1.0.0+1';
 
 // shared_preferences key — stores the ISO-8601 UTC timestamp of the most
 // recent successful sync. Next sync uses this as window_start. Falls back to
-// 30 days ago when absent (first run or after a reinstall).
+// 24 hours ago when absent (first run or after a reinstall).
 const String _lastSyncPrefsKey = 'last_sync_at';
-const Duration _firstSyncWindow = Duration(days: 30);
+const Duration _firstSyncWindow = Duration(hours: 24);
+
+// How far back the Runs tab and the debug export look. Deliberately wider
+// than the first-sync upload window — showing a month of history is useful
+// even though uploads default to the last day.
+const Duration _historyWindow = Duration(days: 30);
 
 // shared_preferences key — filenames of route tracks already uploaded to the
 // server, so Sync only sends new ones. (Server dedup is idempotent anyway; this
@@ -1183,12 +1188,12 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _exportToFile() async {
     setState(() {
       _uploading = true;
-      _status = 'Reading 30 days for export...';
+      _status = 'Reading ${_historyWindow.inDays} days for export...';
     });
 
     try {
       final now = DateTime.now();
-      final windowStart = now.subtract(_firstSyncWindow);
+      final windowStart = now.subtract(_historyWindow);
 
       final built = await _buildSyncPayload(
         windowStart,
@@ -1671,7 +1676,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final windowDays = now.difference(windowStart).inMinutes / (60 * 24);
       final windowLabel = lastSyncIso != null
           ? 'since last sync (${windowDays.toStringAsFixed(1)} days)'
-          : 'full ${_firstSyncWindow.inDays}-day window (first sync)';
+          : 'full ${_firstSyncWindow.inHours}-hour window (first sync)';
 
       final built = await _buildSyncPayload(windowStart, now);
       if (!mounted) return;
@@ -2034,7 +2039,7 @@ class _HomeScreenState extends State<HomeScreen> {
         content: Text(
           'This deletes ALL data uploaded for your account on the server '
           'and resets local sync state. The next Sync re-uploads the full '
-          '${_firstSyncWindow.inDays}-day window and all saved routes.',
+          '${_firstSyncWindow.inHours}-hour window and all saved routes.',
         ),
         actions: [
           TextButton(
@@ -2094,7 +2099,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _status =
             'Server data deleted: ${resp.body}\nLocal sync state '
             'cleared — next Sync re-uploads the full '
-            '${_firstSyncWindow.inDays}-day window + all routes.';
+            '${_firstSyncWindow.inHours}-hour window + all routes.';
       });
     } catch (e) {
       if (!mounted) return;
@@ -2487,7 +2492,7 @@ class _HomeScreenState extends State<HomeScreen> {
     final now = DateTime.now();
     final workouts = await _safeRead(
       HealthDataType.WORKOUT,
-      now.subtract(_firstSyncWindow),
+      now.subtract(_historyWindow),
       now,
     );
     workouts.sort((a, b) => a.dateFrom.compareTo(b.dateFrom));
