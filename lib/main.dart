@@ -58,11 +58,6 @@ const Duration _firstSyncWindow = Duration(hours: 24);
 // even though uploads default to the last day.
 const Duration _historyWindow = Duration(days: 30);
 
-// shared_preferences key — filenames of route tracks already uploaded to the
-// server, so Sync only sends new ones. (Server dedup is idempotent anyway; this
-// just avoids re-POSTing every track on every sync.)
-const String _uploadedRoutesPrefsKey = 'uploaded_route_files';
-
 // shared_preferences key — Health Connect route ids (workout uuid) already
 // uploaded to the server, so Sync only sends new ones.
 const String _uploadedHcRoutesPrefsKey = 'uploaded_hc_routes';
@@ -111,23 +106,6 @@ List<LatLng> smoothPath(List<LatLng> pts, {int window = _pathSmoothingWindow}) {
     out.add(LatLng(lat / n, lng / n));
   }
   return out;
-}
-
-// Summary of a saved run, parsed from a track JSON file for the Runs list.
-class _RunSummary {
-  final File file;
-  final DateTime start;
-  final double km;
-  final Duration duration;
-  final int pointCount;
-
-  _RunSummary({
-    required this.file,
-    required this.start,
-    required this.km,
-    required this.duration,
-    required this.pointCount,
-  });
 }
 
 // One logical run assembled from Health Connect workouts. Multiple apps often
@@ -208,42 +186,8 @@ class _HcRun {
   }
 }
 
-// Read-only map view of one saved run: its path, with start/end markers,
-// framed to fit the whole route.
-class _RunMapPage extends StatelessWidget {
-  final String title;
-  final String subtitle;
-  final List<LatLng> points;
-
-  const _RunMapPage({
-    required this.title,
-    required this.subtitle,
-    required this.points,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(title),
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(24),
-          child: Padding(
-            padding: const EdgeInsets.only(bottom: 8),
-            child: Text(subtitle, style: theme.textTheme.bodySmall),
-          ),
-        ),
-      ),
-      body: points.isEmpty
-          ? const Center(child: Text('No points in this run.'))
-          : _RouteMapView(points),
-    );
-  }
-}
-
 // The map itself: route polyline with start/end markers, framed to fit.
-// Shared by the full-page map (_RunMapPage) and the run detail page.
+// Shown on the run detail page when the run has a GPS route.
 class _RouteMapView extends StatelessWidget {
   final List<LatLng> points;
 
@@ -467,10 +411,6 @@ class _HomeScreenState extends State<HomeScreen> {
   // watermark. null = check in progress; -1 = never synced.
   int? _pendingSamples;
   DateTime? _lastSyncAt;
-
-  // Cached future for the debug local-recordings list — refreshed when opened
-  // so a just-saved run shows up, without re-reading the dir on every rebuild.
-  Future<List<_RunSummary>>? _runsFuture;
 
   // Cached future for the Runs tab: workouts other apps wrote to Health
   // Connect, grouped into logical runs. Refreshed when the tab is opened.
@@ -1726,23 +1666,9 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
-      // Also upload any recorded GPS route tracks (see SERVER_SCHEMA.md
-      // "Route tracks"). Independent of the health upload above.
-      setState(() => _status = 'Uploading recorded routes...');
-      final routes = await _uploadRouteTracks(prefs);
-      if (!mounted) return;
-      if (routes.unauthorized) {
-        await _auth.invalidate();
-        if (!mounted) return;
-        setState(() {
-          _uploading = false;
-          _status = 'Sign-in expired. Please sign in again, then re-tap Sync.';
-        });
-        return;
-      }
-
-      // ...and any GPS routes other apps attached to their workouts in
-      // Health Connect (Fitbit / Pixel Watch runs).
+      // Also upload any GPS routes other apps attached to their workouts in
+      // Health Connect (Fitbit / Pixel Watch runs). Independent of the health
+      // upload above — see SERVER_SCHEMA.md "Route tracks".
       setState(() => _status = 'Uploading Health Connect routes...');
       final hcRoutes = await _uploadHealthConnectRoutes(
         prefs,
@@ -1760,13 +1686,10 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
-      final routesUploaded = routes.uploaded + hcRoutes.uploaded;
-      final routesFailed = routes.failed + hcRoutes.failed;
-      final routeMsg = (routesUploaded == 0 && routesFailed == 0)
+      final routeMsg = (hcRoutes.uploaded == 0 && hcRoutes.failed == 0)
           ? ' No new routes.'
-          : ' Routes: $routesUploaded uploaded'
-                '${hcRoutes.uploaded > 0 ? " (${hcRoutes.uploaded} from Health Connect)" : ""}'
-                '${routesFailed > 0 ? ", $routesFailed failed" : ""}.';
+          : ' Routes: ${hcRoutes.uploaded} uploaded'
+                '${hcRoutes.failed > 0 ? ", ${hcRoutes.failed} failed" : ""}.';
       final consentMsg = hcRoutes.pendingConsent > 0
           ? '\n${hcRoutes.pendingConsent} Health Connect route(s) unreadable — '
                 'grant "Exercise routes → Always allow" in Health Connect → '
@@ -1791,56 +1714,6 @@ class _HomeScreenState extends State<HomeScreen> {
       });
       _refreshPendingData();
     }
-  }
-
-  // Uploads saved route tracks the client hasn't sent yet to POST /routes,
-  // tracking which filenames are done in shared_preferences. Files stay on
-  // device (so the Runs tab keeps them); failures are retried next sync.
-  Future<({int uploaded, int failed, bool unauthorized})> _uploadRouteTracks(
-    SharedPreferences prefs,
-  ) async {
-    final dir = await getApplicationDocumentsDirectory();
-    final files = dir.listSync().whereType<File>().where(
-      (f) => f.path.endsWith('.json') && f.path.contains('xc_route_'),
-    );
-    final done = (prefs.getStringList(_uploadedRoutesPrefsKey) ?? []).toSet();
-    var uploaded = 0;
-    var failed = 0;
-    for (final f in files) {
-      final name = f.uri.pathSegments.last;
-      if (done.contains(name)) continue; // already uploaded
-      try {
-        final body = await f.readAsString();
-        final resp = await http
-            .post(
-              Uri.parse('$_serverBase/routes'),
-              headers: {
-                'Content-Type': 'application/json',
-                ..._auth.authHeaders,
-              },
-              body: body,
-            )
-            .timeout(const Duration(seconds: 60));
-        if (resp.statusCode == 401) {
-          await prefs.setStringList(_uploadedRoutesPrefsKey, done.toList());
-          return (uploaded: uploaded, failed: failed, unauthorized: true);
-        }
-        if (resp.statusCode >= 200 && resp.statusCode < 300) {
-          done.add(name);
-          uploaded++;
-        } else {
-          debugPrint(
-            '[routes] $name rejected: ${resp.statusCode} ${resp.body}',
-          );
-          failed++;
-        }
-      } catch (e) {
-        debugPrint('[routes] upload of $name failed: $e');
-        failed++; // network/timeout — retried next sync
-      }
-    }
-    await prefs.setStringList(_uploadedRoutesPrefsKey, done.toList());
-    return (uploaded: uploaded, failed: failed, unauthorized: false);
   }
 
   // Uploads GPS routes that OTHER apps (Fitbit, Pixel Watch, ...) attached to
@@ -2091,7 +1964,6 @@ class _HomeScreenState extends State<HomeScreen> {
       }
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_lastSyncPrefsKey);
-      await prefs.remove(_uploadedRoutesPrefsKey);
       await prefs.remove(_uploadedHcRoutesPrefsKey);
       if (!mounted) return;
       setState(() {
@@ -2686,139 +2558,6 @@ class _HomeScreenState extends State<HomeScreen> {
     return '$m:${s.toString().padLeft(2, '0')} /km';
   }
 
-  // Debug-only: list of runs recorded in-app (local files), newest first.
-  Widget _buildRunsPage(ThemeData theme) {
-    return FutureBuilder<List<_RunSummary>>(
-      future: _runsFuture ?? _loadRuns(),
-      builder: (context, snap) {
-        if (snap.connectionState != ConnectionState.done) {
-          return const Center(child: CircularProgressIndicator());
-        }
-        final runs = snap.data ?? [];
-        if (runs.isEmpty) {
-          return const Center(
-            child: Padding(
-              padding: EdgeInsets.all(32),
-              child: Text(
-                'No recorded runs yet.\nRecord one on the Record tab.',
-                textAlign: TextAlign.center,
-              ),
-            ),
-          );
-        }
-        return ListView.separated(
-          itemCount: runs.length,
-          separatorBuilder: (_, _) => const Divider(height: 1),
-          itemBuilder: (context, i) {
-            final r = runs[i];
-            return ListTile(
-              leading: const Icon(Icons.route),
-              title: Text(_fmtRunDate(r.start)),
-              subtitle: Text(
-                '${r.km.toStringAsFixed(2)} km · '
-                '${_fmtDuration(r.duration)} · ${r.pointCount} pts',
-              ),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => _openRun(r),
-              onLongPress: () => _confirmDeleteRun(r),
-            );
-          },
-        );
-      },
-    );
-  }
-
-  Future<List<_RunSummary>> _loadRuns() async {
-    final dir = await getApplicationDocumentsDirectory();
-    final files = dir.listSync().whereType<File>().where(
-      (f) => f.path.endsWith('.json') && f.path.contains('xc_route_'),
-    );
-    final runs = <_RunSummary>[];
-    for (final f in files) {
-      try {
-        final m = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
-        runs.add(
-          _RunSummary(
-            file: f,
-            start: DateTime.parse(m['start_time'] as String),
-            km: (m['distance_meters'] as num).toDouble() / 1000,
-            duration: Duration(seconds: (m['duration_seconds'] as num).toInt()),
-            pointCount: (m['point_count'] as num).toInt(),
-          ),
-        );
-      } catch (_) {
-        // Skip malformed files.
-      }
-    }
-    runs.sort((a, b) => b.start.compareTo(a.start)); // newest first
-    return runs;
-  }
-
-  Future<void> _confirmDeleteRun(_RunSummary r) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete this run?'),
-        content: Text(
-          '${_fmtRunDate(r.start)}\n'
-          '${r.km.toStringAsFixed(2)} km · ${_fmtDuration(r.duration)} · '
-          '${r.pointCount} points\n\nThis permanently deletes the saved track.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(ctx).colorScheme.error,
-              foregroundColor: Theme.of(ctx).colorScheme.onError,
-            ),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true) return;
-    try {
-      await r.file.delete();
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _status = 'Could not delete run: $e');
-      return;
-    }
-    if (!mounted) return;
-    setState(() {
-      _runsFuture = _loadRuns(); // refresh the list
-    });
-  }
-
-  Future<void> _openRun(_RunSummary r) async {
-    try {
-      final m = jsonDecode(await r.file.readAsString()) as Map<String, dynamic>;
-      final pts = [
-        for (final p in (m['points'] as List))
-          LatLng((p['lat'] as num).toDouble(), (p['lng'] as num).toDouble()),
-      ];
-      if (!mounted) return;
-      await Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => _RunMapPage(
-            title: _fmtRunDate(r.start),
-            subtitle:
-                '${r.km.toStringAsFixed(2)} km · '
-                '${_fmtDuration(r.duration)} · ${r.pointCount} points',
-            points: pts,
-          ),
-        ),
-      );
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => _status = 'Could not open run: $e');
-    }
-  }
-
   String _fmtRunDate(DateTime utc) {
     final d = utc.toLocal();
     const months = [
@@ -2995,23 +2734,6 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
           const SizedBox(height: 8),
           debugButton(Icons.route, 'Grant HC Route Access', _grantRouteAccess),
-          const SizedBox(height: 8),
-          // In-app recordings live on as a dev tool; the Runs tab now shows
-          // Health Connect workouts instead.
-          debugButton(Icons.folder_open, 'Local Recorded Runs', () {
-            _runsFuture = _loadRuns();
-            Navigator.of(context).push(
-              MaterialPageRoute(
-                builder: (_) => Scaffold(
-                  appBar: AppBar(
-                    title: const Text('Local Recorded Runs'),
-                    centerTitle: true,
-                  ),
-                  body: _buildRunsPage(theme),
-                ),
-              ),
-            );
-          }),
           const SizedBox(height: 8),
           if (_permissionsGranted) ...[
             debugButton(Icons.favorite, 'Read Heart Rate', _readHeartRate),
