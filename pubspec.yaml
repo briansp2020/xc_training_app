@@ -61,7 +61,8 @@ dev_dependencies:
 # by the launcher's circular adaptive-icon mask.
 flutter_launcher_icons:
   android: true
-  ios: false
+  ios: true
+  remove_alpha_ios: true # App Store rejects icons with an alpha channel
   image_path: "assets/icon/app_icon.jpg"
   adaptive_icon_background: "#81C6F0"
   adaptive_icon_foreground: "assets/icon/app_icon.jpg"
