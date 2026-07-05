@@ -22,6 +22,20 @@
 	<string>$(FLUTTER_BUILD_NAME)</string>
 	<key>CFBundleSignature</key>
 	<string>????</string>
+
+	<!-- DEV ONLY: the dev server is plain HTTP on the LAN. iOS App Transport
+	     Security blocks cleartext by default. Remove this whole dict once the
+	     server is HTTPS (mirrors Android's usesCleartextTraffic). -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+	<!-- iOS 14+ can prompt before an app talks to a LAN device (the dev
+	     server at 10.0.0.x). This string backs that prompt. -->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>XC Training connects to your training server on your local network to sync data.</string>
+
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -29,14 +43,14 @@
 			<string>Editor</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>com.googleusercontent.apps.YOUR_IOS_CLIENT_ID</string>
+				<string>com.googleusercontent.apps.573308562088-kn5bet5928bi7tf7f733k4plrs0lers4</string>
 			</array>
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>GIDClientID</key>
-	<string>YOUR_IOS_CLIENT_ID.apps.googleusercontent.com</string>
+	<string>573308562088-kn5bet5928bi7tf7f733k4plrs0lers4.apps.googleusercontent.com</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSHealthShareUsageDescription</key>

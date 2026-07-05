@@ -34,11 +34,34 @@ POST /auth/google
 → { "access_token": "<server jwt>", "token_type": "bearer", "athlete": {...} }
 ```
 
-The Google ID token's `aud` claim must match the OAuth **web** client ID the
-server is configured with (the client passes the same value to
-`GoogleSignIn.initialize(serverClientId: ...)`). The server rejects tokens
-minted for any other audience — this is what stops an ID token from an
-unrelated app being replayed against `/auth/google`.
+The server must validate the Google ID token's `aud` (audience) claim, but
+**`aud` is not the same value on every platform** — so the server has to accept
+*any of this project's own OAuth client IDs*, not a single hard-coded one:
+
+| Platform | `aud` on the ID token | Why |
+|---|---|---|
+| Android | **Web** client ID | `GoogleSignIn.initialize(serverClientId:)` mints the token for the web/server client. |
+| iOS | **iOS** client ID | The GoogleSignIn-iOS SDK always stamps the token with the app's *own* iOS client ID. `serverClientId` only produces a separate `serverAuthCode` — it does **not** change `aud`. |
+
+So the server must treat the token as valid when `aud` matches **any** client ID
+registered to this project. Verify the signature/issuer as usual, then check
+`aud` against an allow-list:
+
+| Role | Client ID |
+|---|---|
+| Web (server audience) | `573308562088-qgrfv6kup46837fdoudleedg8quv0jp3.apps.googleusercontent.com` |
+| iOS | `573308562088-kn5bet5928bi7tf7f733k4plrs0lers4.apps.googleusercontent.com` |
+| Android | *(add the Android OAuth client ID here)* |
+
+This is still safe: the allow-list contains only *our* OAuth clients, so an ID
+token minted for an unrelated app is still rejected (`401`, "Google token
+audience mismatch"). Pin the audience to a single value and iOS sign-ins fail
+even though Android works.
+
+> Implementation note (google-auth / Python): call
+> `id_token.verify_oauth2_token(token, request)` **without** the `audience=`
+> argument (which pins a single value), then assert `idinfo["aud"]` is in the
+> allow-list above.
 
 Send `Authorization: Bearer <access_token>` on every subsequent request and
 persist the token (it currently lasts 30 days; the server will add refresh
