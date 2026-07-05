@@ -1609,7 +1609,11 @@ class _HomeScreenState extends State<HomeScreen> {
     return (payload: payload, totalSamples: totalSamples);
   }
 
-  Future<void> _syncHealthData() async {
+  // [backfill] (debug): ignore the server watermark and upload the full
+  // _historyWindow. Safe to repeat — the server's composite-key upsert
+  // dedups everything; the payload carries "backfill": true so the server
+  // can tell this overlap is deliberate.
+  Future<void> _syncHealthData({bool backfill = false}) async {
     setState(() {
       _uploading = true;
       _status = 'Reading data from Health Connect...';
@@ -1618,22 +1622,30 @@ class _HomeScreenState extends State<HomeScreen> {
     try {
       final prefs = await SharedPreferences.getInstance();
       if (!mounted) return;
-      setState(() => _status = 'Checking what the server already has...');
-      final serverWatermark = await _fetchServerWatermark();
-      if (!mounted) return;
-      setState(() => _status = 'Reading data from Health Connect...');
       final now = DateTime.now();
-      final windowStart = serverWatermark != null
-          ? serverWatermark.subtract(_watermarkOverlap)
-          : now.subtract(_firstSyncWindow);
-      final windowDays = now.difference(windowStart).inMinutes / (60 * 24);
-      final windowLabel = serverWatermark != null
-          ? 'since last sync (${windowDays.toStringAsFixed(1)} days)'
-          : 'full ${_firstSyncWindow.inHours}-hour window (first sync)';
+      final DateTime windowStart;
+      final String windowLabel;
+      if (backfill) {
+        windowStart = now.subtract(_historyWindow);
+        windowLabel = 'backfill (${_historyWindow.inDays} days)';
+      } else {
+        setState(() => _status = 'Checking what the server already has...');
+        final serverWatermark = await _fetchServerWatermark();
+        if (!mounted) return;
+        setState(() => _status = 'Reading data from Health Connect...');
+        windowStart = serverWatermark != null
+            ? serverWatermark.subtract(_watermarkOverlap)
+            : now.subtract(_firstSyncWindow);
+        final windowDays = now.difference(windowStart).inMinutes / (60 * 24);
+        windowLabel = serverWatermark != null
+            ? 'since last sync (${windowDays.toStringAsFixed(1)} days)'
+            : 'full ${_firstSyncWindow.inHours}-hour window (first sync)';
+      }
 
       final built = await _buildSyncPayload(windowStart, now);
       if (!mounted) return;
       final payload = built.payload;
+      if (backfill) payload['backfill'] = true;
       final totalSamples = built.totalSamples;
       final workoutCount = (payload['workouts'] as List).length;
 
@@ -2741,9 +2753,15 @@ class _HomeScreenState extends State<HomeScreen> {
             _resetSyncWatermark,
           ),
           const SizedBox(height: 8),
-          debugButton(Icons.route, 'Grant HC Route Access', _grantRouteAccess),
-          const SizedBox(height: 8),
           if (_permissionsGranted) ...[
+            debugButton(
+              Icons.history,
+              'Upload Past ${_historyWindow.inDays} Days (backfill)',
+              () {
+                if (!_uploading) _syncHealthData(backfill: true);
+              },
+            ),
+            const SizedBox(height: 8),
             debugButton(Icons.favorite, 'Read Heart Rate', _readHeartRate),
             const SizedBox(height: 8),
             debugButton(

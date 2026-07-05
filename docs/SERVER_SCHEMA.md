@@ -135,7 +135,8 @@ Serialized JSON: **~15 MB per athlete per sync**. Plan for this in your reverse 
 | `client_version` | string | App version. |
 | `uploaded_at` | ISO-8601 UTC | When the client built the payload. |
 | `source_platform` | string | `"googleHealthConnect"` (Android) or `"appleHealthKit"` (iOS, future). |
-| `window_start` / `window_end` | ISO-8601 UTC | The time range the client queried. **Last 24 hours** on first sync; since-watermark afterwards. |
+| `window_start` / `window_end` | ISO-8601 UTC | The time range the client queried. **Last 24 hours** on first sync; since-watermark afterwards; the full history window on a backfill. |
+| `backfill` | boolean, **optional** | Present and `true` only when the upload came from the debug **"Upload Past 30 Days"** button, which ignores the watermark and re-sends the full history window. Storage needs no special handling — the composite-key upserts dedup the overlap — but the flag lets the server distinguish a deliberate re-send from a real gap: skip overlap/anomaly warnings, log it as a backfill, and re-run session detection over the whole window. Absent on normal syncs. |
 | `workouts` | array | Explicit exercise sessions the recording app wrote. May be empty. |
 | `*_samples` / `*_sessions` arrays | array | All raw samples in `[window_start, window_end]`. Empty array if the type had no data or wasn't permissioned. |
 
