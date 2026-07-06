@@ -29,7 +29,7 @@ flutter run --dart-define-from-file=config/dev.json -d <device-id>
 
 `config/dev.json` is per-developer and gitignored; copy `config/dev.json.example` to start. The defaults (when no flag is passed) are `http://10.0.2.2:8000` (the Android emulator's alias for the host's localhost) and an empty Google client ID (Google Sign-In disabled, dev-login still works).
 
-From a physical phone use the host's LAN IP (e.g. `http://10.0.0.23:8000`), and the server must bind to `0.0.0.0`, not `127.0.0.1`. The manifest currently allows cleartext traffic; remove `android:usesCleartextTraffic="true"` when switching to HTTPS.
+From a physical phone use the host's LAN IP (e.g. `http://10.0.0.23:8000`), and the server must bind to `0.0.0.0`, not `127.0.0.1`. The `10.0.2.2` default only works on the Android emulator — a real iPhone or Android phone always needs the LAN IP. On Android the manifest allows cleartext traffic (`android:usesCleartextTraffic="true"`); on iOS the same is done with a dev-only `NSAllowsArbitraryLoads` exception in `ios/Runner/Info.plist`. Remove both when switching to HTTPS.
 
 ## Auth
 
@@ -44,12 +44,15 @@ The token is persisted in `shared_preferences` and replayed on every sync. 401 r
 
 1. Open the [Google Cloud Console](https://console.cloud.google.com/), create or select a project, and enable the **Identity Services API**.
 2. **OAuth consent screen** → set up an "External" consent screen (Internal works only inside a Google Workspace org). Required scopes: `openid`, `email`, `profile`.
-3. **Credentials** → **Create credentials** → **OAuth client ID**, twice:
+3. **Credentials** → **Create credentials** → **OAuth client ID**, once per platform:
    - **Web application** — this is the *audience* the server validates ID tokens against. Copy its client ID into `config/dev.json` as `GOOGLE_SERVER_CLIENT_ID` and tell the server about it too.
    - **Android** — package name `com.github.briansp2020.xctraining`, SHA-1 of the keystore you sign with. Get the debug SHA-1 with `keytool -list -v -keystore "%USERPROFILE%/.android/debug.keystore" -alias androiddebugkey -storepass android -keypass android`. Add the release SHA-1 once you have a release keystore.
+   - **iOS** — bundle ID `com.github.briansp2020.xctraining`. Put its client ID into `ios/Runner/Info.plist` as `GIDClientID`, and add the **reversed** client ID (`com.googleusercontent.apps.<id>`) as a URL scheme under `CFBundleURLTypes` so the sign-in callback returns. The iOS client is separate from the web client passed as `serverClientId`.
 4. Add test users on the OAuth consent screen until you publish the app — Google rejects sign-ins from accounts that aren't listed during the "Testing" phase.
 
 The `google_sign_in` package (v7+) uses Android's Credential Manager API under the hood, so no `google-services.json` is required — just the OAuth client IDs registered above.
+
+**The ID token's `aud` differs by platform.** On Android it's the *web* client ID; on iOS it's the *iOS* client ID — the GoogleSignIn-iOS SDK always stamps the app's own client ID, and `serverClientId` only produces a `serverAuthCode`, not a different audience. So the server must accept **any** of the project's client IDs as a valid audience, not a single pinned value, or iOS sign-ins fail with `401 "Google token audience mismatch"`. See [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md) "Auth".
 
 ## Android / Health Connect gotchas
 
@@ -61,3 +64,22 @@ These bit us during development and aren't obvious from the code:
 - **Total vs Active calories are separate Health Connect permissions.** The `health` package's workout reader internally queries `TotalCaloriesBurnedRecord`, so the manifest needs `READ_TOTAL_CALORIES_BURNED` even though our Dart code uses `HealthDataType.ACTIVE_ENERGY_BURNED`. Without it, workout reads silently return empty (the package swallows the SecurityException).
 - **Fitbit doesn't always write `ExerciseSessionRecord` for activities it tracks** — treadmill sessions in particular show up only as raw HR + step streams. This is why the server detects sessions from raw signals instead of trusting the explicit workouts list.
 - Pixel Pro Fold has two displays. To screenshot the right one via adb: `screencap -p -d <display-id>`. To keep the screen on during dev: `adb shell settings put global stay_on_while_plugged_in 7`.
+
+## iOS / HealthKit gotchas
+
+Building for Apple needs the full **Xcode** app (not just Command Line Tools) plus **CocoaPods**. After `flutter pub get`, run `pod install` in `ios/` if pods drift.
+
+- **Signing:** a free Apple ID works for on-device dev (7-day builds), but the team needs a **registered device** — connect the iPhone *before* Xcode can issue a provisioning profile (otherwise "your team has no devices"). Set the team + toggle the **HealthKit** capability in Xcode → Runner target → Signing & Capabilities; the entitlement file (`ios/Runner/Runner.entitlements`) is already wired. TestFlight/App Store needs the paid Developer Program.
+- **Deployment target is iOS 14** (the `health` plugin's floor). It's set in both the `Podfile` and the Xcode project — keep them in sync.
+- **The `health` plugin uses CocoaPods, not Swift Package Manager** (you'll see a warning saying so); the other plugins use SPM. Both are integrated.
+- **Debug builds crash instantly when launched from the home screen** on iOS 26 ProMotion devices — a null deref in `VSyncClient` / `createTouchRateCorrectionVSyncClientIfNeeded` ([flutter#183900](https://github.com/flutter/flutter/issues/183900)). It's a Flutter engine bug for *untethered debug* launches, **not** an app bug. **Test with release builds**, which is also how TestFlight runs.
+- **Install/launch with `flutter build` + `devicectl`, not `flutter run`** — the latter's launch step is flaky on Xcode 26 ("Timed out waiting for CONFIGURATION_BUILD_DIR"). The **phone must be unlocked** for the launch step (otherwise "device was not, or could not be, unlocked"); set Auto-Lock → Never during dev.
+  ```
+  flutter build ios --release --dart-define-from-file=config/dev.json
+  xcrun devicectl device install app --device <udid> build/ios/iphoneos/Runner.app
+  xcrun devicectl device process launch --device <udid> com.github.briansp2020.xctraining
+  ```
+- **HealthKit usage strings** live in `ios/Runner/Info.plist` (`NSHealthShareUsageDescription`; the app only reads, so there's no Update key). A missing string crashes the app the moment it requests authorization.
+- **"Workout Routes" is its own HealthKit read permission**, defaults OFF, and **iOS never reveals read-permission status to the app** — a denied route permission just returns empty, silently. If routes don't show, check Settings → Privacy & Security → Health → XC Training → Workout Routes is on. Routes only exist for outdoor GPS workouts (indoor workouts have none).
+- **No separate route-consent step on iOS.** Health Connect needs one (via the Android-only `xctraining/route_access` method channel in `MainActivity.kt`); HealthKit covers routes with the standard permission. So onboarding is **2 steps** on iOS (health → auto-upload) vs 3 on Android.
+- **App Transport Security blocks cleartext HTTP** — see "Server config" for the dev-only `NSAllowsArbitraryLoads` + `NSLocalNetworkUsageDescription` in `Info.plist`.
