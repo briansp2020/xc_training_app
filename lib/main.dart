@@ -109,6 +109,29 @@ List<LatLng> smoothPath(List<LatLng> pts, {int window = _pathSmoothingWindow}) {
   return out;
 }
 
+// On iOS the health plugin maps several Android-only names onto a single
+// HKWorkoutActivityType (RUNNING_TREADMILL → .running, ROCK_CLIMBING →
+// .climbing, SWIMMING_POOL / SWIMMING_OPEN_WATER → .swimming) and reverse-maps
+// on read with first(where:) over an *unordered* Swift dictionary — so a plain
+// outdoor run can come back labeled RUNNING_TREADMILL at random. HealthKit
+// can't even express those distinctions in the activity type, so on iOS
+// collapse the aliases to their canonical names. Android's are real distinct
+// Health Connect types — leave them alone.
+String _canonicalActivityType(String name) {
+  if (!Platform.isIOS) return name;
+  switch (name) {
+    case 'RUNNING_TREADMILL':
+      return 'RUNNING';
+    case 'ROCK_CLIMBING':
+      return 'CLIMBING';
+    case 'SWIMMING_POOL':
+    case 'SWIMMING_OPEN_WATER':
+      return 'SWIMMING';
+    default:
+      return name;
+  }
+}
+
 // One logical run assembled from Health Connect workouts. Multiple apps often
 // write the SAME physical run (e.g. Fitbit records it with a route but types
 // it OTHER; Strava imports it typed RUNNING but without a route), so workouts
@@ -156,7 +179,7 @@ class _HcRun {
     for (final m in members) {
       final v = m.value;
       if (v is WorkoutHealthValue && v.workoutActivityType.name != 'OTHER') {
-        return v.workoutActivityType.name;
+        return _canonicalActivityType(v.workoutActivityType.name);
       }
     }
     if (Platform.isAndroid && hasRoute && (mph ?? 0) > 3.5) {
@@ -1599,7 +1622,9 @@ class _HomeScreenState extends State<HomeScreen> {
         'source_uuid': w.uuid,
         'source_app': w.sourceName,
         'source_device_id': w.sourceDeviceId,
-        'activity_type': wv?.workoutActivityType.name ?? 'OTHER',
+        'activity_type': _canonicalActivityType(
+          wv?.workoutActivityType.name ?? 'OTHER',
+        ),
         'recording_method': w.recordingMethod.name,
         'start_time': w.dateFrom.toUtc().toIso8601String(),
         'end_time': w.dateTo.toUtc().toIso8601String(),
