@@ -1,4 +1,4 @@
-# XC Training Data — developer notes
+# Chadwick XC Training App — developer notes
 
 See [README.md](README.md) for what this project is, how to run it, current state, and roadmap. See [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md) for the upload contract.
 
@@ -82,6 +82,6 @@ Building for Apple needs the full **Xcode** app (not just Command Line Tools) pl
   xcrun devicectl device process launch --device <udid> com.github.codingwithwarren.xctraining
   ```
 - **HealthKit usage strings** live in `ios/Runner/Info.plist` (`NSHealthShareUsageDescription`; the app only reads, so there's no Update key). A missing string crashes the app the moment it requests authorization.
-- **"Workout Routes" is its own HealthKit read permission**, defaults OFF, and **iOS never reveals read-permission status to the app** — a denied route permission just returns empty, silently. If routes don't show, check Settings → Privacy & Security → Health → XC Training → Workout Routes is on. Routes only exist for outdoor GPS workouts (indoor workouts have none).
+- **"Workout Routes" is its own HealthKit read permission**, defaults OFF, and **iOS never reveals read-permission status to the app** — a denied route permission just returns empty, silently. If routes don't show, check Settings → Privacy & Security → Health → Chadwick XC Training → Workout Routes is on. Routes only exist for outdoor GPS workouts (indoor workouts have none).
 - **No separate route-consent step on iOS.** Health Connect needs one (via the Android-only `xctraining/route_access` method channel in `MainActivity.kt`); HealthKit covers routes with the standard permission. So onboarding is **2 steps** on iOS (health → auto-upload) vs 3 on Android.
 - **App Transport Security blocks cleartext HTTP** — see "Server config" for the dev-only `NSAllowsArbitraryLoads` + `NSLocalNetworkUsageDescription` in `Info.plist`.

@@ -34,7 +34,7 @@
 	<!-- iOS 14+ can prompt before an app talks to a LAN device (the dev
 	     server at 10.0.0.x). This string backs that prompt. -->
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>XC Training connects to your training server on your local network to sync data.</string>
+	<string>Chadwick XC Training connects to your training server on your local network to sync data.</string>
 
 	<key>CFBundleURLTypes</key>
 	<array>
@@ -54,7 +54,7 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSHealthShareUsageDescription</key>
-	<string>XC Training reads your recorded workouts — and the heart rate, distance, energy, and GPS route around each one — from Apple Health to share with your team. Nothing outside your workouts is read.</string>
+	<string>Chadwick XC Training reads your recorded workouts — and the heart rate, distance, energy, and GPS route around each one — from Apple Health to share with your team. Nothing outside your workouts is read.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

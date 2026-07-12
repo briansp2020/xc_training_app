@@ -1,4 +1,4 @@
-# XC Training Data
+# Chadwick XC Training App
 
 A Flutter app that uploads **recorded workouts only** — each workout record plus the heart rate, steps, distance, and calories within ±10 minutes of it — to a server for cross country team analysis. Nothing between workouts leaves the phone (no sleep, resting HR, or all-day streams). The client is a thin uploader; analysis happens server-side.
 

@@ -1813,7 +1813,7 @@ class _HomeScreenState extends State<HomeScreen> {
       final consentMsg = hcRoutes.pendingConsent > 0
           ? '\n${hcRoutes.pendingConsent} Health Connect route(s) unreadable — '
                 'grant "Exercise routes → Always allow" in Health Connect → '
-                'App permissions → XC Training Data, then Sync again.'
+                'App permissions → Chadwick XC Training, then Sync again.'
           : '';
       setState(() {
         _uploading = false;
@@ -2449,6 +2449,13 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               )
             else if (routeActive) ...[
+              Text(
+                'When Health Connect asks, choose "Allow all" so every '
+                'run\'s route is shared with the team.',
+                style: theme.textTheme.bodyLarge,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
               FilledButton.icon(
                 onPressed: _grantRouteAccess,
                 icon: const Icon(Icons.route),

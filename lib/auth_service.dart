@@ -5,7 +5,7 @@ import 'package:google_sign_in/google_sign_in.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-/// Token + sign-in handling for the XC Training Data app.
+/// Token + sign-in handling for the Chadwick XC Training app.
 ///
 /// The server requires `Authorization: Bearer <jwt>` on every request. This
 /// class:

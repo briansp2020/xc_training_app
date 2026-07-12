@@ -1,6 +1,6 @@
-# Server Schema — XC Training Data Upload
+# Server Schema — Chadwick XC Training App Upload
 
-This document describes the JSON payload the **XC Training Data** mobile app POSTs to the analysis server.
+This document describes the JSON payload the **Chadwick XC Training** mobile app POSTs to the analysis server.
 
 **The app uploads workout data only** (privacy decision, July 2026). Each sync ships the recorded workouts in the window plus the continuous streams (heart rate, steps, distance, calories) read **only within ±10 minutes of each workout** — warm-up/cool-down context. Nothing between workouts leaves the phone, and the recovery streams (sleep, HRV, resting heart rate, respiratory rate) are no longer read, requested, or uploaded at all — their payload arrays are gone.
 
