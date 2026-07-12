@@ -1,6 +1,6 @@
 # XC Training Data
 
-A Flutter app that uploads raw health data (the last 24 hours by default; incremental after the first sync) — heart rate samples, steps, distance, calories, sleep, and any explicit workout records — to a server for cross country team analysis. The client is a thin uploader; all analysis (including detecting workouts from raw HR + cadence) happens server-side.
+A Flutter app that uploads **recorded workouts only** — each workout record plus the heart rate, steps, distance, and calories within ±10 minutes of it — to a server for cross country team analysis. Nothing between workouts leaves the phone (no sleep, resting HR, or all-day streams). The client is a thin uploader; analysis happens server-side.
 
 Runs on **Android** (Health Connect) and **iOS** (HealthKit).
 
@@ -39,7 +39,7 @@ xcrun devicectl device process launch --device <udid> com.github.codingwithwarre
 Working end-to-end on Android and iOS phones:
 
 1. Google Sign-In (or dev-login) → server JWT; auto-detects/requests health permissions on launch
-2. Reads all 19 supported streams (last 24 hours on first sync, incremental afterwards)
+2. Reads workouts (last 24 hours on first sync, incremental afterwards) and the samples around each one
 3. POSTs as `type: "health_sync"` to the configured server (verified accepted)
 
 The DEBUG ONLY section of the UI also exposes **Discover Workout Data** (dumps last 5 workouts as raw JSON to the `flutter run` console) and **Scan All Data (30d)** (per-type counts and peak-HR-per-day summary) for ad-hoc schema discovery. Both will be removed before shipping.

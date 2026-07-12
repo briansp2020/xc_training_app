@@ -2,9 +2,11 @@
 
 This document describes the JSON payload the **XC Training Data** mobile app POSTs to the analysis server.
 
-The intent is to ship **as much raw data as Health Connect (Android) or HealthKit (iOS) exposes** over the sync window (24 hours on first sync, incremental afterwards), so the server can derive everything — including **detecting exercise sessions from raw HR + step streams** when the recording app (Fitbit, etc.) failed to wrap them in an `ExerciseSessionRecord`.
+**The app uploads workout data only** (privacy decision, July 2026). Each sync ships the recorded workouts in the window plus the continuous streams (heart rate, steps, distance, calories) read **only within ±10 minutes of each workout** — warm-up/cool-down context. Nothing between workouts leaves the phone, and the recovery streams (sleep, HRV, resting heart rate, respiratory rate) are no longer read, requested, or uploaded at all — their payload arrays are gone.
 
-The client is a thin uploader. It does **not** aggregate, smooth, classify, or compute derived metrics. All of that happens server-side.
+Consequence for the server: **session detection from raw 24/7 streams no longer applies** — an activity the recording app didn't wrap in an `ExerciseSessionRecord` never reaches the server. Detection/classification logic still applies *within* uploaded workout windows (e.g. relabeling Fitbit's `OTHER`).
+
+The client remains a thin uploader. It does **not** aggregate, smooth, classify, or compute derived metrics. All of that happens server-side.
 
 ---
 
@@ -85,14 +87,7 @@ can be tested without a Google round-trip.
 
 ### Body size
 
-A 30-day window for one athlete with a Fitbit-class HR sensor produces roughly:
-- ~160,000 HR samples
-- ~2,000 step records
-- ~900 distance records
-- ~470 total-calorie records
-- ~50 sleep stage records
-
-Serialized JSON: **~15 MB per athlete per sync**. Plan for this in your reverse proxy and uvicorn body-size limits (the FastAPI default is fine; nginx caps at 1 MB by default — bump `client_max_body_size` to 32m+).
+Uploads are workout-scoped, so payloads are small: a 45-minute workout (±10 min padding) with a Fitbit-class 1 Hz HR sensor is roughly ~4,000 HR samples plus a few hundred interval records — **well under 1 MB per workout**. Even a 30-day backfill with daily workouts stays in the single-digit MB range. (Historical note: the old whole-window uploads ran ~15 MB per 30 days — the `client_max_body_size 32m` reverse-proxy bump from that era is still safe to keep.)
 
 ---
 
@@ -110,30 +105,23 @@ Serialized JSON: **~15 MB per athlete per sync**. Plan for this in your reverse 
 
   "workouts": [ /* see "Workouts" below — may be empty */ ],
 
-  "heart_rate_samples":         [ /* NumericSample, BPM        */ ],
-  "speed_samples":              [ /* NumericSample, m/s        */ ],
-  "hrv_rmssd_samples":          [ /* NumericSample, ms         */ ],
-  "resting_heart_rate_samples": [ /* NumericSample, BPM        */ ],
-  "respiratory_rate_samples":   [ /* NumericSample, breaths/min */ ],
-  "blood_oxygen_samples":       [ /* NumericSample, percent    */ ],
-  "skin_temperature_samples":   [ /* NumericSample, °C         */ ],
-  "body_temperature_samples":   [ /* NumericSample, °C         */ ],
+  "heart_rate_samples":         [ /* NumericSample, BPM       */ ],
 
   "step_samples":               [ /* IntervalSample, count    */ ],
   "distance_samples":           [ /* IntervalSample, meters   */ ],
   "total_calorie_samples":      [ /* IntervalSample, kcal     */ ],
-  "active_energy_samples":      [ /* IntervalSample, kcal     */ ],
-  "basal_energy_samples":       [ /* IntervalSample, kcal     */ ],
-  "flights_climbed_samples":    [ /* IntervalSample, count    */ ],
-  "activity_intensity_samples": [ /* IntervalSample, minutes  */ ],
-
-  "sleep_sessions":             [ /* IntervalSample, minutes  */ ],
-  "sleep_deep_samples":         [ /* IntervalSample, minutes  */ ],
-  "sleep_rem_samples":          [ /* IntervalSample, minutes  */ ],
-  "sleep_light_samples":        [ /* IntervalSample, minutes  */ ],
-  "sleep_awake_samples":        [ /* IntervalSample, minutes  */ ]
+  "active_energy_samples":      [ /* IntervalSample, kcal     */ ]
 }
 ```
+
+All sample arrays contain only records within ±10 minutes of a workout in
+`workouts`. The previously documented streams — `speed_samples`,
+`hrv_rmssd_samples`, `resting_heart_rate_samples`, `respiratory_rate_samples`,
+`blood_oxygen_samples`, `skin_temperature_samples`, `body_temperature_samples`,
+`basal_energy_samples`, `flights_climbed_samples`,
+`activity_intensity_samples`, `sleep_sessions`, and the `sleep_*_samples`
+stage arrays — **are no longer sent** (workout-only upload policy). The server
+should tolerate their absence; old rows already stored can stay.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -145,7 +133,7 @@ Serialized JSON: **~15 MB per athlete per sync**. Plan for this in your reverse 
 | `window_start` / `window_end` | ISO-8601 UTC | The time range the client queried. **Last 24 hours** on first sync; since-watermark afterwards; the full history window on a backfill. |
 | `backfill` | boolean, **optional** | Present and `true` only when the upload came from the debug **"Upload Past 30 Days"** button, which ignores the watermark and re-sends the full history window. Storage needs no special handling — the composite-key upserts dedup the overlap — but the flag lets the server distinguish a deliberate re-send from a real gap: skip overlap/anomaly warnings, log it as a backfill, and re-run session detection over the whole window. Absent on normal syncs. |
 | `workouts` | array | Explicit exercise sessions the recording app wrote. May be empty. |
-| `*_samples` / `*_sessions` arrays | array | All raw samples in `[window_start, window_end]`. Empty array if the type had no data or wasn't permissioned. |
+| `*_samples` arrays | array | Samples within **±10 minutes of a workout** in `workouts` (never the whole window). Empty array if there were no workouts, the type had no data, or it wasn't permissioned. |
 
 Arrays are always present even when empty — makes the schema easy to consume.
 
@@ -301,7 +289,7 @@ INSERT INTO interval_samples (uuid, stream, start_time, ...) VALUES (...)
 ON CONFLICT (uuid, stream, start_time) DO UPDATE SET value = EXCLUDED.value, ...;
 ```
 
-Re-uploads with the same keys idempotently update. The client syncs incrementally, and **the server owns the watermark**: before each sync the client calls `GET /me/last-sample-time` (below) and re-queries `[watermark - 24 hours, now]`. The 24-hour overlap re-reads the tail of the previous window so Health Connect inserts that arrive late still get captured — Fitbit batches HR 30–60 minutes after the fact, and derives resting HR, HRV, and sleep from overnight data delivered hours late — and your composite-key dedup is what makes that overlap free. When the server has no data for the athlete (first sync, or right after `DELETE /me/data`), the client uploads the last 24 hours.
+Re-uploads with the same keys idempotently update. The client syncs incrementally, and **the server owns the watermark**: before each sync the client calls `GET /me/last-sample-time` (below) and re-queries `[watermark - 24 hours, now]`. The 24-hour overlap re-reads the tail of the previous window so records that arrive in Health Connect late still get captured — a workout can land hours after it happened (Fitbit syncs to the phone lazily), and HR batches 30–60 minutes behind — and your composite-key dedup is what makes that overlap free. When the server has no data for the athlete (first sync, or right after `DELETE /me/data`), the client uploads the last 24 hours.
 
 ### Sync watermark: `GET /me/last-sample-time`
 

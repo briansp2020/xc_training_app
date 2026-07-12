@@ -54,7 +54,7 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSHealthShareUsageDescription</key>
-	<string>XC Training reads your workouts, heart rate, GPS routes, and sleep from Apple Health to sync your training data.</string>
+	<string>XC Training reads your recorded workouts — and the heart rate, distance, energy, and GPS route around each one — from Apple Health to share with your team. Nothing outside your workouts is read.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

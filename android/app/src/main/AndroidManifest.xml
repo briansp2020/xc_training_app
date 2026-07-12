@@ -6,17 +6,15 @@
     <!-- Health Connect read permissions.
          Note: the health package reads TotalCaloriesBurnedRecord (not Active) when
          aggregating workout calories, so READ_TOTAL_CALORIES_BURNED is required
-         for workout reads to return anything. -->
+         for workout reads to return anything.
+         Recovery permissions (sleep, HRV, resting HR, respiratory rate) were
+         deliberately removed: the app uploads workout data only. -->
     <uses-permission android:name="android.permission.health.READ_HEART_RATE"/>
     <uses-permission android:name="android.permission.health.READ_STEPS"/>
     <uses-permission android:name="android.permission.health.READ_DISTANCE"/>
-    <uses-permission android:name="android.permission.health.READ_SLEEP"/>
     <uses-permission android:name="android.permission.health.READ_ACTIVE_CALORIES_BURNED"/>
     <uses-permission android:name="android.permission.health.READ_TOTAL_CALORIES_BURNED"/>
     <uses-permission android:name="android.permission.health.READ_EXERCISE"/>
-    <uses-permission android:name="android.permission.health.READ_HEART_RATE_VARIABILITY"/>
-    <uses-permission android:name="android.permission.health.READ_RESTING_HEART_RATE"/>
-    <uses-permission android:name="android.permission.health.READ_RESPIRATORY_RATE"/>
     <!-- GPS routes other apps (Fitbit, Pixel Watch) attach to their workouts.
          Reading routes written by OTHER apps additionally needs a one-time
          "Exercise routes → Always allow" grant in Health Connect's app

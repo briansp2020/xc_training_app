@@ -59,6 +59,11 @@ const Duration _firstSyncWindow = Duration(hours: 24);
 // even though uploads default to the last day.
 const Duration _historyWindow = Duration(days: 30);
 
+// The app uploads workout data only: continuous streams (HR, steps, distance,
+// calories) are read solely within this padding around each recorded workout.
+// The padding keeps warm-up / cool-down context for HR-recovery analysis.
+const Duration _workoutPadding = Duration(minutes: 10);
+
 // shared_preferences keys — onboarding state. route_access_done marks the
 // route-consent step completed (granted or explicitly skipped); auto_sync
 // stores the user's automatic-upload choice (absence = not asked yet, which
@@ -446,8 +451,8 @@ class _HomeScreenState extends State<HomeScreen> {
   bool get _onboarded =>
       _permissionsGranted && _routeAccessDone && _autoSyncEnabled != null;
 
-  // Home-page upload status: samples in the core streams newer than the
-  // server's watermark. null = check in progress; -1 = never synced;
+  // Home-page upload status: recorded workouts newer than the server's
+  // watermark. null = check in progress; -1 = never synced;
   // -2 = server unreachable.
   int? _pendingSamples;
   DateTime? _lastSyncAt;
@@ -480,17 +485,9 @@ class _HomeScreenState extends State<HomeScreen> {
     // returns empty without this permission.
     HealthDataType.TOTAL_CALORIES_BURNED,
     HealthDataType.WORKOUT,
-    // Recovery / fitness extras
-    HealthDataType.HEART_RATE_VARIABILITY_RMSSD,
-    HealthDataType.RESTING_HEART_RATE,
-    HealthDataType.RESPIRATORY_RATE,
-    // Sleep — READ_SLEEP covers SLEEP_ASLEEP and the stage types.
-    HealthDataType.SLEEP_ASLEEP,
-    HealthDataType.SLEEP_SESSION,
-    HealthDataType.SLEEP_DEEP,
-    HealthDataType.SLEEP_REM,
-    HealthDataType.SLEEP_LIGHT,
-    HealthDataType.SLEEP_AWAKE,
+    // Recovery streams (sleep, HRV, resting HR, respiratory rate) are
+    // deliberately NOT read or requested: the app uploads workout data only
+    // (privacy decision, 2026-07). Don't re-add without revisiting that.
   ];
 
   // All types are READ-only. The debug "Insert Test Workout" button no longer
@@ -562,9 +559,10 @@ class _HomeScreenState extends State<HomeScreen> {
     return t == null ? null : DateTime.parse(t as String).toLocal();
   }
 
-  // Recomputes the home page's upload status: how many samples in the core
-  // streams are newer than the server's watermark. HR trickles in
-  // continuously, so any nonzero count shows the Sync button.
+  // Recomputes the home page's upload status: how many recorded workouts are
+  // newer than the server's watermark. Only workout data uploads, so between
+  // workouts the app is legitimately "all caught up" — continuous HR must not
+  // count here or the Sync button would never disappear.
   Future<void> _refreshPendingData() async {
     if (!_onboarded || !_auth.isSignedIn) return;
     setState(() => _pendingSamples = null); // check in progress
@@ -599,17 +597,10 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final now = DateTime.now();
-    var count = 0;
-    for (final t in [
-      HealthDataType.WORKOUT,
-      HealthDataType.HEART_RATE,
-      HealthDataType.STEPS,
-    ]) {
-      count += (await _safeRead(t, last, now)).length;
-      if (!mounted) return;
-    }
+    final workouts = await _safeRead(HealthDataType.WORKOUT, last, now);
+    if (!mounted) return;
     setState(() {
-      _pendingSamples = count;
+      _pendingSamples = workouts.length;
       _lastSyncAt = last!.toLocal();
     });
   }
@@ -1575,9 +1566,6 @@ class _HomeScreenState extends State<HomeScreen> {
   // declare the matching READ_* permission), or the read returns empty.
   static const Map<String, HealthDataType> _numericStreams = {
     'heart_rate_samples': HealthDataType.HEART_RATE,
-    'hrv_rmssd_samples': HealthDataType.HEART_RATE_VARIABILITY_RMSSD,
-    'resting_heart_rate_samples': HealthDataType.RESTING_HEART_RATE,
-    'respiratory_rate_samples': HealthDataType.RESPIRATORY_RATE,
   };
 
   static const Map<String, HealthDataType> _intervalStreams = {
@@ -1585,15 +1573,13 @@ class _HomeScreenState extends State<HomeScreen> {
     'distance_samples': HealthDataType.DISTANCE_DELTA,
     'total_calorie_samples': HealthDataType.TOTAL_CALORIES_BURNED,
     'active_energy_samples': HealthDataType.ACTIVE_ENERGY_BURNED,
-    'sleep_sessions': HealthDataType.SLEEP_SESSION,
-    'sleep_deep_samples': HealthDataType.SLEEP_DEEP,
-    'sleep_rem_samples': HealthDataType.SLEEP_REM,
-    'sleep_light_samples': HealthDataType.SLEEP_LIGHT,
-    'sleep_awake_samples': HealthDataType.SLEEP_AWAKE,
   };
 
-  /// Reads workouts + every configured stream over [windowStart, now] and
-  /// assembles the `health_sync` payload. Shared by sync and export so the
+  /// Reads workouts over [windowStart, now] and assembles the `health_sync`
+  /// payload. The app uploads **workout data only** (privacy decision,
+  /// 2026-07): the continuous streams (HR, steps, distance, calories) are
+  /// read solely within ±[_workoutPadding] of each recorded workout — nothing
+  /// between workouts ever leaves the phone. Shared by sync and export so the
   /// two can't drift (a past divergence here caused an OOM). Updates `_status`
   /// per stream; [labelSuffix] distinguishes the caller in that text.
   ///
@@ -1609,6 +1595,39 @@ class _HomeScreenState extends State<HomeScreen> {
     // Workouts use the package's special WORKOUT path (it aggregates
     // distance/calories/steps from related records). Separate read.
     final workouts = await _safeRead(HealthDataType.WORKOUT, windowStart, now);
+
+    // Padded, merged time ranges around the recorded workouts — the only
+    // ranges the continuous streams are read from. Merging keeps overlapping
+    // paddings (back-to-back or double-recorded workouts) as one range.
+    final sorted = [...workouts]
+      ..sort((a, b) => a.dateFrom.compareTo(b.dateFrom));
+    final windows = <({DateTime start, DateTime end})>[];
+    for (final w in sorted) {
+      final s = w.dateFrom.subtract(_workoutPadding);
+      final e = w.dateTo.add(_workoutPadding);
+      if (windows.isNotEmpty && !s.isAfter(windows.last.end)) {
+        if (e.isAfter(windows.last.end)) {
+          windows.last = (start: windows.last.start, end: e);
+        }
+      } else {
+        windows.add((start: s, end: e));
+      }
+    }
+
+    // Reads one stream across all workout windows, deduping records that
+    // straddle two adjacent ranges.
+    Future<List<HealthDataPoint>> readAroundWorkouts(HealthDataType t) async {
+      final seen = <String>{};
+      final out = <HealthDataPoint>[];
+      for (final win in windows) {
+        for (final p in await _safeRead(t, win.start, win.end)) {
+          if (seen.add('${p.uuid}/${p.dateFrom.microsecondsSinceEpoch}')) {
+            out.add(p);
+          }
+        }
+      }
+      return out;
+    }
 
     final workoutPayloads = workouts.map((w) {
       final wv = w.value is WorkoutHealthValue
@@ -1645,13 +1664,13 @@ class _HomeScreenState extends State<HomeScreen> {
     var totalSamples = 0;
     for (final e in _numericStreams.entries) {
       if (mounted) setState(() => _status = 'Reading ${e.key}$labelSuffix...');
-      final samples = await _safeRead(e.value, windowStart, now);
+      final samples = await readAroundWorkouts(e.value);
       payload[e.key] = samples.map(_numericSample).toList();
       totalSamples += samples.length;
     }
     for (final e in _intervalStreams.entries) {
       if (mounted) setState(() => _status = 'Reading ${e.key}$labelSuffix...');
-      final samples = await _safeRead(e.value, windowStart, now);
+      final samples = await readAroundWorkouts(e.value);
       payload[e.key] = samples.map(_intervalSample).toList();
       totalSamples += samples.length;
     }
@@ -2773,7 +2792,9 @@ class _HomeScreenState extends State<HomeScreen> {
       statusLine = 'All data uploaded.';
     } else {
       statusIcon = Icons.cloud_upload;
-      statusLine = '$pending new samples since your last sync.';
+      statusLine = pending == 1
+          ? '1 new workout since your last sync.'
+          : '$pending new workouts since your last sync.';
     }
 
     return SingleChildScrollView(
