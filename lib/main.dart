@@ -59,10 +59,6 @@ const Duration _firstSyncWindow = Duration(hours: 24);
 // even though uploads default to the last day.
 const Duration _historyWindow = Duration(days: 30);
 
-// shared_preferences key — Health Connect route ids (workout uuid) already
-// uploaded to the server, so Sync only sends new ones.
-const String _uploadedHcRoutesPrefsKey = 'uploaded_hc_routes';
-
 // shared_preferences keys — onboarding state. route_access_done marks the
 // route-consent step completed (granted or explicitly skipped); auto_sync
 // stores the user's automatic-upload choice (absence = not asked yet, which
@@ -1706,8 +1702,6 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => _status = 'Reading data from Health Connect...');
 
     try {
-      final prefs = await SharedPreferences.getInstance();
-      if (!mounted) return;
       final now = DateTime.now();
       final DateTime windowStart;
       final String windowLabel;
@@ -1767,13 +1761,19 @@ class _HomeScreenState extends State<HomeScreen> {
         return;
       }
 
-      // Also upload any GPS routes other apps attached to their workouts in
-      // Health Connect (Fitbit / Pixel Watch runs). Independent of the health
+      // Also upload any GPS routes other apps attached to their workouts
+      // (Fitbit / Pixel Watch / Apple Watch runs). Independent of the health
       // upload above — see SERVER_SCHEMA.md "Route tracks".
-      setState(() => _status = 'Uploading Health Connect routes...');
+      //
+      // Deliberately NOT the incremental sample window: the watermark rides
+      // the continuous HR stream, so a route that wasn't readable during the
+      // sync right after its run (route permission granted later, Watch
+      // delivered the route late) would fall behind the watermark and never
+      // be scanned again. Routes are few, so always scan the full history
+      // window — dedup against the server's route list keeps it idempotent.
+      setState(() => _status = 'Uploading workout routes...');
       final hcRoutes = await _uploadHealthConnectRoutes(
-        prefs,
-        windowStart,
+        now.subtract(_historyWindow),
         now,
       );
       if (!mounted) return;
@@ -1817,23 +1817,43 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // Uploads GPS routes that OTHER apps (Fitbit, Pixel Watch, ...) attached to
-  // their Health Connect workouts, as route_track payloads to POST /routes.
+  // Uploads GPS routes that OTHER apps (Fitbit, Pixel Watch, Apple Watch...)
+  // attached to their workouts, as route_track payloads to POST /routes.
   // Routes the user hasn't consented to yet read back with no locations
   // (ConsentRequired) — counted in pendingConsent so the status can tell the
   // user to grant "Exercise routes" in Health Connect's app permissions.
   Future<({int uploaded, int failed, int pendingConsent, bool unauthorized})>
-  _uploadHealthConnectRoutes(
-    SharedPreferences prefs,
-    DateTime windowStart,
-    DateTime now,
-  ) async {
+  _uploadHealthConnectRoutes(DateTime windowStart, DateTime now) async {
+    // Dedup against the server, like the sample watermark — the server is the
+    // source of truth for what it already has. A local list would go stale on
+    // a server-side wipe (routes never re-sent) or an app reinstall.
+    final Set<String> done;
+    try {
+      final resp = await http
+          .get(Uri.parse('$_serverBase/routes'), headers: _auth.authHeaders)
+          .timeout(const Duration(seconds: 30));
+      if (resp.statusCode == 401) {
+        return (uploaded: 0, failed: 0, pendingConsent: 0, unauthorized: true);
+      }
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        throw Exception('server returned ${resp.statusCode}');
+      }
+      done = {
+        for (final r in jsonDecode(resp.body) as List)
+          (r as Map<String, dynamic>)['client_route_id'] as String,
+      };
+    } catch (e) {
+      // Can't know what the server has — skip route upload this sync rather
+      // than re-send everything; surfaced as a failure so it isn't silent.
+      debugPrint('[hc-routes] listing server routes failed: $e');
+      return (uploaded: 0, failed: 1, pendingConsent: 0, unauthorized: false);
+    }
+
     final points = await _safeRead(
       HealthDataType.WORKOUT_ROUTE,
       windowStart,
       now,
     );
-    final done = (prefs.getStringList(_uploadedHcRoutesPrefsKey) ?? []).toSet();
     var uploaded = 0;
     var failed = 0;
     var pendingConsent = 0;
@@ -1849,6 +1869,25 @@ class _HomeScreenState extends State<HomeScreen> {
         pendingConsent++;
         continue;
       }
+      // iOS: the health plugin never surfaces the parent workout's uuid for a
+      // route (Android does), and the server joins routes to workouts on
+      // source_workout_uuid — a null leaves the route orphaned. Recover the
+      // uuid by time overlap with the workout it belongs to.
+      var workoutUuid = v.workoutUuid;
+      if (workoutUuid == null) {
+        final nearby = await _safeRead(
+          HealthDataType.WORKOUT,
+          r.dateFrom.subtract(const Duration(minutes: 10)),
+          r.dateTo.add(const Duration(minutes: 10)),
+        );
+        for (final w in nearby) {
+          if (w.value is! WorkoutHealthValue) continue;
+          if (w.dateFrom.isBefore(r.dateTo) && w.dateTo.isAfter(r.dateFrom)) {
+            workoutUuid = w.uuid;
+            break;
+          }
+        }
+      }
       final locs = v.locations;
       var dist = 0.0;
       for (var i = 1; i < locs.length; i++) {
@@ -1863,7 +1902,7 @@ class _HomeScreenState extends State<HomeScreen> {
         'type': 'route_track',
         'client_route_id': id,
         'source': 'health_connect',
-        'source_workout_uuid': v.workoutUuid,
+        'source_workout_uuid': workoutUuid,
         'recorded_at': now.toUtc().toIso8601String(),
         'start_time': r.dateFrom.toUtc().toIso8601String(),
         'end_time': r.dateTo.toUtc().toIso8601String(),
@@ -1894,7 +1933,6 @@ class _HomeScreenState extends State<HomeScreen> {
             )
             .timeout(const Duration(seconds: 60));
         if (resp.statusCode == 401) {
-          await prefs.setStringList(_uploadedHcRoutesPrefsKey, done.toList());
           return (
             uploaded: uploaded,
             failed: failed,
@@ -1905,6 +1943,10 @@ class _HomeScreenState extends State<HomeScreen> {
         if (resp.statusCode >= 200 && resp.statusCode < 300) {
           done.add(id);
           uploaded++;
+        } else if (resp.statusCode == 409) {
+          // Server already has this client_route_id and won't upsert —
+          // treat as synced so it isn't retried forever.
+          done.add(id);
         } else {
           debugPrint(
             '[hc-routes] $id rejected: ${resp.statusCode} ${resp.body}',
@@ -1916,7 +1958,6 @@ class _HomeScreenState extends State<HomeScreen> {
         failed++; // network/timeout — retried next sync
       }
     }
-    await prefs.setStringList(_uploadedHcRoutesPrefsKey, done.toList());
     return (
       uploaded: uploaded,
       failed: failed,
@@ -2063,10 +2104,8 @@ class _HomeScreenState extends State<HomeScreen> {
         });
         return;
       }
-      // The sync watermark lives on the server and was just deleted with the
-      // data; only the local route-dedup list needs clearing.
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.remove(_uploadedHcRoutesPrefsKey);
+      // All sync state (sample watermark, route dedup) lives on the server
+      // and was just deleted with the data — nothing local to clear.
       if (!mounted) return;
       setState(() {
         _uploading = false;

@@ -9,7 +9,7 @@ This file covers things that aren't obvious from reading the code.
 - Flutter 3.44, Dart 3.x
 - `health` ^13.3.1 (Health Connect on Android, HealthKit on iOS)
 - `http` ^1.6.0
-- `shared_preferences` ^2.5.5 (auth token, onboarding state, route-upload dedup — the sync watermark lives on the server, `GET /me/last-sample-time`)
+- `shared_preferences` ^2.5.5 (auth token and onboarding state only — sync state lives on the server: sample watermark via `GET /me/last-sample-time`, route dedup via `GET /routes`)
 - Kotlin on Android, Swift on iOS, minSdk 28
 
 ## Coding conventions

@@ -532,9 +532,11 @@ per-point track** — lat/lng/time plus accuracy, altitude, and speed.
 | Content-Type | `application/json` |
 | Auth | **Required** — `Authorization: Bearer <jwt>`, same as the health sync. |
 
-One run per request. The client uploads each saved track once and, on a `2xx`,
-marks it synced (or deletes the local file). The athlete is derived from the
-token — there is no `athlete_id` in the body.
+One run per request. Before uploading, the client asks `GET /routes` which
+`client_route_id`s the server already has and sends only the missing ones —
+the server is the source of truth for route dedup, exactly like the sample
+watermark (`GET /me/last-sample-time`); no sync state is kept on the device.
+The athlete is derived from the token — there is no `athlete_id` in the body.
 
 ### Payload — `route_track`
 
@@ -571,7 +573,7 @@ This is exactly what the app writes to its local track files today, plus a
 | `type` | string literal `"route_track"` | Discriminator. |
 | `client_route_id` | UUID | The **dedup key**. For `health_connect` routes this is the Health Connect workout uuid (stable across re-uploads). (DIY local files are keyed by `start_time`; the client adds this id when wiring upload — until then, dedup on `(athlete_id, start_time)`.) |
 | `source` | string | `"diy_gps"` for in-app recording; `"health_connect"` for routes other apps (Fitbit, Pixel Watch) attached to their workouts, re-read via Health Connect. |
-| `source_workout_uuid` | UUID, optional | `health_connect` routes only: the `ExerciseSessionRecord` uuid — join it against `workouts.source_uuid` to attach the path to the workout's HR/pace analysis directly (no time-overlap matching needed). |
+| `source_workout_uuid` | UUID, optional | `health_connect` routes: the parent workout's uuid — join it against `workouts.source_uuid` to attach the path to the workout's HR/pace analysis directly. On Android this comes straight from Health Connect; on iOS the health plugin doesn't surface it, so the client recovers it by time-overlap with the workout before uploading. **May still be null** (no overlapping workout found) — fall back to time-overlap reconciliation (below). **POST /routes must upsert on `client_route_id`** (`ON CONFLICT DO UPDATE`), not plain-insert: clients re-send a track to backfill this field (early iOS uploads went out with it null). A `409` on a duplicate is also tolerated — the client then stops re-sending — but upsert is what actually repairs orphaned rows. |
 | `recorded_at` / `start_time` / `end_time` | ISO-8601 UTC | `end_time` is the **stop moment** (not the last fix), so it matches `duration_seconds`. |
 | `duration_seconds` | int | Wall-clock from start to stop. |
 | `distance_meters` | float | Client-summed great-circle distance between consecutive fixes. |
@@ -668,12 +670,11 @@ async def post_route(payload: RouteTrack):
 uploaded**: workouts, every raw sample stream, detected sessions, and route
 tracks. The athlete comes from the Bearer token like every other endpoint.
 
-The app's debug **Reset (wipe server + start over)** button calls this and,
-only after a 2xx, clears its local route-upload dedup list. The sync
-watermark needs no clearing — it lives on the server (`GET
-/me/last-sample-time`) and deleting the data resets it to `null`
-automatically, so the next Sync re-uploads the full first-sync window and
-every route from scratch.
+The app's debug **Reset (wipe server + start over)** button calls this.
+Nothing local needs clearing — all sync state lives on the server (the
+sample watermark via `GET /me/last-sample-time`, route dedup via `GET
+/routes`), and deleting the data resets both automatically, so the next
+Sync re-uploads the full first-sync window and every route from scratch.
 
 No body, no query params. Responses:
 
