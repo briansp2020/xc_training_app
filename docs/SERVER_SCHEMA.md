@@ -49,9 +49,16 @@ registered to this project. Verify the signature/issuer as usual, then check
 
 | Role | Client ID |
 |---|---|
-| Web (server audience) | `573308562088-qgrfv6kup46837fdoudleedg8quv0jp3.apps.googleusercontent.com` |
-| iOS | `573308562088-kn5bet5928bi7tf7f733k4plrs0lers4.apps.googleusercontent.com` |
-| Android | *(add the Android OAuth client ID here)* |
+| Web (server audience) | `210202837170-t1hhp4v24n8fqs6a5kfcb201k2rkvik6.apps.googleusercontent.com` |
+| iOS | *(create in project `210202837170` for bundle ID `com.github.codingwithwarren.xctraining`, then list it here and update `GIDClientID` + the reversed-ID URL scheme in `ios/Runner/Info.plist` — the plist still holds the retired project's client)* |
+
+All clients live in Google Cloud project `210202837170` (the org's management
+account); the original `573308562088` project is retired — tokens minted for
+its client IDs get `401 audience mismatch`. Android never appears in this
+allow-list: Android ID tokens carry the *web* client ID as `aud`. (The Android
+OAuth client — `210202837170-563u76fequa3lh7ntuvsjchu9dkbrpmv` — still has to
+*exist* in the project, paired with the app's package name and signing SHA-1,
+but it never shows up as a token audience.)
 
 This is still safe: the allow-list contains only *our* OAuth clients, so an ID
 token minted for an unrelated app is still rejected (`401`, "Google token

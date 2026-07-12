@@ -31,7 +31,7 @@ flutter run -d <device-id> --dart-define-from-file=config/dev.json
 ```bash
 flutter build ios --release --dart-define-from-file=config/dev.json
 xcrun devicectl device install app --device <udid> build/ios/iphoneos/Runner.app
-xcrun devicectl device process launch --device <udid> com.github.briansp2020.xctraining
+xcrun devicectl device process launch --device <udid> com.github.codingwithwarren.xctraining
 ```
 
 ## Current state

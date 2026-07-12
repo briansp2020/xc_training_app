@@ -29,7 +29,9 @@ flutter run --dart-define-from-file=config/dev.json -d <device-id>
 
 `config/dev.json` is per-developer and gitignored; copy `config/dev.json.example` to start. The defaults (when no flag is passed) are `http://10.0.2.2:8000` (the Android emulator's alias for the host's localhost) and an empty Google client ID (Google Sign-In disabled, dev-login still works).
 
-From a physical phone use the host's LAN IP (e.g. `http://10.0.0.23:8000`), and the server must bind to `0.0.0.0`, not `127.0.0.1`. The `10.0.2.2` default only works on the Android emulator — a real iPhone or Android phone always needs the LAN IP. On Android the manifest allows cleartext traffic (`android:usesCleartextTraffic="true"`); on iOS the same is done with a dev-only `NSAllowsArbitraryLoads` exception in `ios/Runner/Info.plist`. Remove both when switching to HTTPS.
+**The shared server runs at `https://xc-server.duckdns.org`** — reachable from any network, valid TLS, no tunnels needed. Use it unless you're developing against a local server.
+
+For a *local* server: from the emulator use `http://10.0.2.2:8000`; from a physical phone either `adb reverse tcp:8000 tcp:8000` + `http://127.0.0.1:8000` (USB) or the host's LAN IP with the server bound to `0.0.0.0`. Local HTTP only works because the Android manifest allows cleartext traffic (`android:usesCleartextTraffic="true"`) and iOS has a dev-only `NSAllowsArbitraryLoads` exception in `ios/Runner/Info.plist` — both can be removed once local HTTP dev is no longer needed.
 
 ## Auth
 
@@ -46,8 +48,8 @@ The token is persisted in `shared_preferences` and replayed on every sync. 401 r
 2. **OAuth consent screen** → set up an "External" consent screen (Internal works only inside a Google Workspace org). Required scopes: `openid`, `email`, `profile`.
 3. **Credentials** → **Create credentials** → **OAuth client ID**, once per platform:
    - **Web application** — this is the *audience* the server validates ID tokens against. Copy its client ID into `config/dev.json` as `GOOGLE_SERVER_CLIENT_ID` and tell the server about it too.
-   - **Android** — package name `com.github.briansp2020.xctraining`, SHA-1 of the keystore you sign with. Get the debug SHA-1 with `keytool -list -v -keystore "%USERPROFILE%/.android/debug.keystore" -alias androiddebugkey -storepass android -keypass android`. Add the release SHA-1 once you have a release keystore.
-   - **iOS** — bundle ID `com.github.briansp2020.xctraining`. Put its client ID into `ios/Runner/Info.plist` as `GIDClientID`, and add the **reversed** client ID (`com.googleusercontent.apps.<id>`) as a URL scheme under `CFBundleURLTypes` so the sign-in callback returns. The iOS client is separate from the web client passed as `serverClientId`.
+   - **Android** — package name `com.github.codingwithwarren.xctraining`, SHA-1 of the keystore you sign with. Get the debug SHA-1 with `keytool -list -v -keystore "%USERPROFILE%/.android/debug.keystore" -alias androiddebugkey -storepass android -keypass android`. Add the release SHA-1 once you have a release keystore.
+   - **iOS** — bundle ID `com.github.codingwithwarren.xctraining`. Put its client ID into `ios/Runner/Info.plist` as `GIDClientID`, and add the **reversed** client ID (`com.googleusercontent.apps.<id>`) as a URL scheme under `CFBundleURLTypes` so the sign-in callback returns. The iOS client is separate from the web client passed as `serverClientId`.
 4. Add test users on the OAuth consent screen until you publish the app — Google rejects sign-ins from accounts that aren't listed during the "Testing" phase.
 
 The `google_sign_in` package (v7+) uses Android's Credential Manager API under the hood, so no `google-services.json` is required — just the OAuth client IDs registered above.
@@ -77,7 +79,7 @@ Building for Apple needs the full **Xcode** app (not just Command Line Tools) pl
   ```
   flutter build ios --release --dart-define-from-file=config/dev.json
   xcrun devicectl device install app --device <udid> build/ios/iphoneos/Runner.app
-  xcrun devicectl device process launch --device <udid> com.github.briansp2020.xctraining
+  xcrun devicectl device process launch --device <udid> com.github.codingwithwarren.xctraining
   ```
 - **HealthKit usage strings** live in `ios/Runner/Info.plist` (`NSHealthShareUsageDescription`; the app only reads, so there's no Update key). A missing string crashes the app the moment it requests authorization.
 - **"Workout Routes" is its own HealthKit read permission**, defaults OFF, and **iOS never reveals read-permission status to the app** — a denied route permission just returns empty, silently. If routes don't show, check Settings → Privacy & Security → Health → XC Training → Workout Routes is on. Routes only exist for outdoor GPS workouts (indoor workouts have none).

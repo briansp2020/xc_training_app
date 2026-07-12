@@ -211,7 +211,7 @@ class _RouteMapView extends StatelessWidget {
       children: [
         TileLayer(
           urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-          userAgentPackageName: 'com.github.briansp2020.xctraining',
+          userAgentPackageName: 'com.github.codingwithwarren.xctraining',
         ),
         PolylineLayer(
           polylines: [
@@ -1167,7 +1167,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // into an emulator for testing the server's session-detection
   // algorithm against real data without re-syncing the phone.
   //
-  // Output: /storage/emulated/0/Android/data/com.github.briansp2020.xctraining/files/health_export.json
+  // Output: /storage/emulated/0/Android/data/com.github.codingwithwarren.xctraining/files/health_export.json
   // ============================================================
   Future<void> _exportToFile() async {
     setState(() {

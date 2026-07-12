@@ -1,4 +1,4 @@
-package com.github.briansp2020.xctraining
+package com.github.codingwithwarren.xctraining
 
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.contracts.ExerciseRouteRequestContract
