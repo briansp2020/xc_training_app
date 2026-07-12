@@ -1,4 +1,4 @@
 {
-  "SERVER_URL": "http://YOUR_SERVER_HOST:8000",
-  "GOOGLE_SERVER_CLIENT_ID": "YOUR_WEB_OAUTH_CLIENT_ID.apps.googleusercontent.com"
+  "SERVER_URL": "https://xc-server.duckdns.org",
+  "GOOGLE_SERVER_CLIENT_ID": "210202837170-qkbmq2a7j90ekfkdr0srj2k54mklsslr.apps.googleusercontent.com"
 }
