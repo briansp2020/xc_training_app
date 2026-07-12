@@ -118,6 +118,10 @@ class _HcRun {
   DateTime start;
   DateTime end;
 
+  // A WORKOUT_ROUTE record exists for this run (set by _loadHcRuns; true even
+  // when consent blocks reading the points — the route still exists).
+  bool hasRoute = false;
+
   _HcRun(HealthDataPoint first) : start = first.dateFrom, end = first.dateTo {
     members.add(first);
   }
@@ -135,13 +139,28 @@ class _HcRun {
 
   Duration get duration => end.difference(start);
 
-  // Best label across the group: any specific type beats OTHER.
+  // Average speed in miles per hour, when distance and duration allow.
+  double? get mph {
+    final d = distanceMeters;
+    final s = duration.inSeconds;
+    if (d == null || s <= 0) return null;
+    return d / s / 0.44704; // m/s → mph
+  }
+
+  // Best label across the group: any specific type beats OTHER. On Android an
+  // untyped group that looks like a run — it has a GPS route and averages
+  // over 3.5 mph — displays as Running (Fitbit exports auto-detected runs as
+  // OTHER). Display only: uploads carry the raw type and the server
+  // classifies from raw signals.
   String get activityType {
     for (final m in members) {
       final v = m.value;
       if (v is WorkoutHealthValue && v.workoutActivityType.name != 'OTHER') {
         return v.workoutActivityType.name;
       }
+    }
+    if (Platform.isAndroid && hasRoute && (mph ?? 0) > 3.5) {
+      return 'RUNNING';
     }
     return 'OTHER';
   }
@@ -2434,6 +2453,31 @@ class _HomeScreenState extends State<HomeScreen> {
         runs.add(_HcRun(w));
       }
     }
+
+    // Mark runs that have a GPS route — feeds the looks-like-a-run display
+    // heuristic in _HcRun.activityType. Matched by workout uuid, falling
+    // back to time overlap (route records exist even when consent blocks
+    // reading their points).
+    final routes = await _safeRead(
+      HealthDataType.WORKOUT_ROUTE,
+      now.subtract(_historyWindow),
+      now,
+    );
+    for (final p in routes) {
+      final v = p.value;
+      if (v is! WorkoutRouteHealthValue) continue;
+      for (final run in runs) {
+        final matches =
+            run.uuids.contains(v.workoutUuid) ||
+            run.uuids.contains(p.uuid) ||
+            (p.dateFrom.isBefore(run.end) && p.dateTo.isAfter(run.start));
+        if (matches) {
+          run.hasRoute = true;
+          break;
+        }
+      }
+    }
+
     return runs.reversed.toList(); // newest first
   }
 
