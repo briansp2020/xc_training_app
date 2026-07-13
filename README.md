@@ -7,7 +7,7 @@ Runs on **Android** (Health Connect) and **iOS** (HealthKit).
 ## Prerequisites
 
 - Flutter 3.44+
-- A server willing to accept ~15 MB JSON POSTs — see [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md)
+- A server implementing the upload contract — see [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md)
 - **Android:** device on API 28+ with Health Connect installed and populated (Fitbit, Strava, Google Fit, Wear OS, etc.), USB debugging enabled
 - **iOS:** macOS with the full **Xcode** + **CocoaPods**, and a **physical iPhone** — HealthKit and GPS routes don't exist on the Simulator. A free Apple ID signs dev builds onto your own device; TestFlight/App Store needs the paid Apple Developer Program. See [CLAUDE.md](CLAUDE.md) "iOS / HealthKit gotchas".
 
@@ -46,13 +46,19 @@ The DEBUG ONLY section of the UI also exposes **Discover Workout Data** (dumps l
 
 ## Roadmap
 
-1. Server-side session detection — recovers Fitbit-tracked sessions that aren't wrapped in `ExerciseSessionRecord` (algorithm in [docs/SERVER_SCHEMA.md](docs/SERVER_SCHEMA.md))
-2. Background sync via WorkManager
-3. Strava OAuth server-side for GPS routes (never in Health Connect)
-4. Multi-athlete: replace hardcoded `_athleteId = 1` with login / device token
-5. iOS: TestFlight / App Store distribution (needs the paid Apple Developer Program)
-6. Remove the debug-only UI section
-7. HTTPS + drop the cleartext exceptions (`usesCleartextTraffic` on Android, `NSAllowsArbitraryLoads` on iOS)
+Still open:
+
+1. Background sync via WorkManager (currently syncs on app open)
+2. iOS: TestFlight / App Store distribution (needs the paid Apple Developer Program)
+3. Remove the debug-only UI section (already hidden in release builds)
+4. Drop the local-dev cleartext exceptions (`usesCleartextTraffic` on Android, `NSAllowsArbitraryLoads` on iOS) once local-HTTP development is no longer needed
+
+Already shipped (was on the roadmap):
+
+- **Multi-athlete** — Google Sign-In → server JWT; the server keys all data to the athlete in the token and ignores the payload's `athlete_id`. Any number of athletes can sign in.
+- **HTTPS** — the shared server runs behind valid TLS at `https://xc-server.duckdns.org`.
+- **GPS routes** — read from Health Connect via a native route-consent flow (see [CLAUDE.md](CLAUDE.md)), so the planned Strava OAuth path isn't needed.
+- **Server-side session detection from raw streams** — obsoleted by the workout-only upload policy (raw 24/7 streams are no longer uploaded); detection/classification now applies only within uploaded workout windows.
 
 ## Where things live
 
