@@ -64,6 +64,9 @@ const Duration _historyWindow = Duration(days: 30);
 // The padding keeps warm-up / cool-down context for HR-recovery analysis.
 const Duration _workoutPadding = Duration(minutes: 10);
 
+// Distances display in miles (US team). Health Connect stores meters.
+const double _metersPerMile = 1609.344;
+
 // shared_preferences keys — onboarding state. route_access_done marks the
 // route-consent step completed (granted or explicitly skipped); auto_sync
 // stores the user's automatic-upload choice (absence = not asked yet, which
@@ -168,8 +171,11 @@ class _HcRun {
     final d = distanceMeters;
     final s = duration.inSeconds;
     if (d == null || s <= 0) return null;
-    return d / s / 0.44704; // m/s → mph
+    return (d / _metersPerMile) / (s / 3600);
   }
+
+  double? get miles =>
+      distanceMeters != null ? distanceMeters! / _metersPerMile : null;
 
   // Best label across the group: any specific type beats OTHER. On Android an
   // untyped group that looks like a run — it has a GPS route and averages
@@ -2633,7 +2639,8 @@ class _HomeScreenState extends State<HomeScreen> {
             final r = runs[i];
             final dist = r.distanceMeters;
             final parts = <String>[
-              if (dist != null) '${(dist / 1000).toStringAsFixed(2)} km',
+              if (dist != null)
+                '${(dist / _metersPerMile).toStringAsFixed(2)} mi',
               _fmtDuration(r.duration),
               r.sources.map(_prettySource).join(' + '),
             ];
@@ -2706,15 +2713,19 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     if (!mounted) return;
 
-    final km = run.distanceMeters != null ? run.distanceMeters! / 1000 : null;
+    final miles = run.miles;
     final energy = run.energyKcal;
     final steps = run.steps;
     final stats = <_RunStat>[
-      if (km != null)
-        _RunStat(Icons.straighten, 'Distance', '${km.toStringAsFixed(2)} km'),
+      if (miles != null)
+        _RunStat(
+          Icons.straighten,
+          'Distance',
+          '${miles.toStringAsFixed(2)} mi',
+        ),
       _RunStat(Icons.timer_outlined, 'Duration', _fmtDuration(run.duration)),
-      if (km != null && km > 0)
-        _RunStat(Icons.speed, 'Pace', _fmtPace(run.duration, km)),
+      if (miles != null && miles > 0)
+        _RunStat(Icons.speed, 'Pace', _fmtPace(run.duration, miles)),
       if (energy != null)
         _RunStat(
           Icons.local_fire_department,
@@ -2742,12 +2753,12 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  // Pace as m:ss per km.
-  String _fmtPace(Duration d, double km) {
-    final secPerKm = (d.inSeconds / km).round();
-    final m = secPerKm ~/ 60;
-    final s = secPerKm % 60;
-    return '$m:${s.toString().padLeft(2, '0')} /km';
+  // Pace as m:ss per mile.
+  String _fmtPace(Duration d, double miles) {
+    final secPerMile = (d.inSeconds / miles).round();
+    final m = secPerMile ~/ 60;
+    final s = secPerMile % 60;
+    return '$m:${s.toString().padLeft(2, '0')} /mi';
   }
 
   String _fmtRunDate(DateTime utc) {
