@@ -24,10 +24,13 @@ import 'sync_service.dart';
 const String lastBackgroundSyncPrefsKey = 'last_background_sync';
 
 @pragma('vm:entry-point')
-Future<void> backgroundSync() async {
+Future<void> backgroundSync(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
   DartPluginRegistrant.ensureInitialized();
   const channel = MethodChannel('xctraining/background_sync');
+  // AppDelegate tags each run with what woke us: "bg-app-refresh" (periodic
+  // BGAppRefreshTask) or "healthkit" (new workout landed).
+  final trigger = args.isEmpty ? 'unknown' : args.first;
 
   var success = false;
   var summary = 'not signed in — skipped';
@@ -50,7 +53,7 @@ Future<void> backgroundSync() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(
       lastBackgroundSyncPrefsKey,
-      '${DateTime.now()}\n$summary',
+      '${DateTime.now()} (trigger: $trigger)\n$summary',
     );
   } catch (_) {
     // Recording the outcome is best-effort — never block task completion.

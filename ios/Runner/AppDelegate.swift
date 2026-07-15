@@ -1,11 +1,14 @@
 import BackgroundTasks
 import Flutter
+import HealthKit
 import UIKit
 
 @main
 @objc class AppDelegate: FlutterAppDelegate, FlutterImplicitEngineDelegate {
   // Must match BGTaskSchedulerPermittedIdentifiers in Info.plist.
   static let syncTaskId = "com.github.codingwithwarren.xctraining.sync"
+
+  private let healthStore = HKHealthStore()
 
   // Keeps the headless engine alive while a background sync runs.
   private var backgroundEngine: FlutterEngine?
@@ -15,7 +18,8 @@ import UIKit
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
     // Handlers must be registered before the app finishes launching — iOS
-    // launches us directly into background when the task fires.
+    // launches us directly into background when a task or HealthKit delivery
+    // fires.
     BGTaskScheduler.shared.register(
       forTaskWithIdentifier: Self.syncTaskId, using: nil
     ) { task in
@@ -26,12 +30,15 @@ import UIKit
       }
     }
     Self.scheduleSync()
+    setUpHealthKitBackgroundDelivery()
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
   }
+
+  // MARK: - Periodic wake (BGAppRefreshTask)
 
   // Ask iOS for a background-refresh wake no sooner than an hour from now.
   // Called at launch, on backgrounding (SceneDelegate), and after every task
@@ -50,23 +57,75 @@ import UIKit
     }
   }
 
-  // Runs one headless Dart sync (backgroundSync in lib/background_sync.dart)
-  // and completes the task when Dart reports back — or when iOS's ~30s budget
-  // expires, whichever comes first.
   private func handleSyncTask(_ task: BGAppRefreshTask) {
     Self.scheduleSync() // keep the chain going
+    let forceFinish = runBackgroundSync(trigger: "bg-app-refresh") { success in
+      task.setTaskCompleted(success: success)
+    }
+    task.expirationHandler = { forceFinish() }
+  }
 
+  // MARK: - Immediate wake on new workouts (HealthKit background delivery)
+
+  // HealthKit wakes the app (via the healthkit.background-delivery
+  // entitlement) whenever a new workout is saved — the "run ended → data on
+  // the server minutes later" path. The observer query must be re-registered
+  // on every launch; the update handler's completion callback must always be
+  // called or HealthKit throttles future deliveries.
+  private func setUpHealthKitBackgroundDelivery() {
+    guard HKHealthStore.isHealthDataAvailable() else { return }
+    let workoutType = HKObjectType.workoutType()
+
+    let query = HKObserverQuery(sampleType: workoutType, predicate: nil) {
+      _, completionHandler, error in
+      guard error == nil else {
+        NSLog("[bg-sync] workout observer error: \(String(describing: error))")
+        completionHandler()
+        return
+      }
+      DispatchQueue.main.async {
+        let forceFinish = self.runBackgroundSync(trigger: "healthkit") { _ in
+          completionHandler()
+        }
+        // HealthKit gives no expiration handler — enforce our own budget so
+        // the completion callback always fires.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25) { forceFinish() }
+      }
+    }
+    healthStore.execute(query)
+
+    healthStore.enableBackgroundDelivery(for: workoutType, frequency: .immediate) {
+      ok, error in
+      if !ok {
+        NSLog(
+          "[bg-sync] enableBackgroundDelivery failed: \(String(describing: error))")
+      }
+    }
+  }
+
+  // MARK: - Shared headless sync runner
+
+  // Runs one headless Dart sync (backgroundSync in lib/background_sync.dart)
+  // and calls [onFinish] exactly once — when Dart reports back, or when the
+  // returned force-finish closure is invoked (task expiration / watchdog),
+  // whichever comes first. Main thread only.
+  private func runBackgroundSync(
+    trigger: String, onFinish: @escaping (Bool) -> Void
+  ) -> () -> Void {
     guard backgroundEngine == nil else {
-      // A sync is somehow still running — don't stack a second engine.
-      task.setTaskCompleted(success: false)
-      return
+      // A sync is already running — don't stack a second engine. The running
+      // sync covers this trigger's data anyway.
+      onFinish(false)
+      return {}
     }
 
     let engine = FlutterEngine(name: "background_sync")
     backgroundEngine = engine
     engine.run(
       withEntrypoint: "backgroundSync",
-      libraryURI: "package:xctraining/background_sync.dart"
+      libraryURI: "package:xctraining/background_sync.dart",
+      initialRoute: nil,
+      entrypointArgs: [trigger]
     )
     GeneratedPluginRegistrant.register(with: engine)
 
@@ -77,7 +136,7 @@ import UIKit
         finished = true
         engine.destroyContext()
         self.backgroundEngine = nil
-        task.setTaskCompleted(success: success)
+        onFinish(success)
       }
     }
 
@@ -93,6 +152,6 @@ import UIKit
         result(FlutterMethodNotImplemented)
       }
     }
-    task.expirationHandler = { finish(false) }
+    return { finish(false) }
   }
 }
