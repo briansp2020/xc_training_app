@@ -12,7 +12,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'auth_service.dart';
-import 'background_sync.dart' show lastBackgroundSyncPrefsKey;
+import 'background_sync.dart' show autoSyncPrefsKey, lastBackgroundSyncPrefsKey;
 import 'sync_service.dart';
 
 // Google Cloud Console OAuth 2.0 **web** client ID (the audience the server
@@ -27,12 +27,12 @@ const String _googleServerClientId = String.fromEnvironment(
 // Distances display in miles (US team). Health Connect stores meters.
 const double _metersPerMile = 1609.344;
 
-// shared_preferences keys — onboarding state. route_access_done marks the
-// route-consent step completed (granted or explicitly skipped); auto_sync
-// stores the user's automatic-upload choice (absence = not asked yet, which
-// keeps them in onboarding).
+// shared_preferences key — onboarding state. route_access_done marks the
+// route-consent step completed (granted or explicitly skipped). The
+// automatic-upload choice uses autoSyncPrefsKey (shared with the background
+// entrypoint, imported from background_sync.dart); absence = not asked yet,
+// which keeps the user in onboarding.
 const String _routeAccessDonePrefsKey = 'route_access_done';
-const String _autoSyncPrefsKey = 'auto_sync_enabled';
 
 // shared_preferences key — iOS only: the health permission sheet has been
 // shown and accepted. HealthKit never discloses READ-grant status (the
@@ -452,8 +452,8 @@ class _HomeScreenState extends State<HomeScreen> {
       // route step is always satisfied; skip it.
       _routeAccessDone =
           Platform.isIOS || (prefs.getBool(_routeAccessDonePrefsKey) ?? false);
-      _autoSyncEnabled = prefs.containsKey(_autoSyncPrefsKey)
-          ? prefs.getBool(_autoSyncPrefsKey)
+      _autoSyncEnabled = prefs.containsKey(autoSyncPrefsKey)
+          ? prefs.getBool(autoSyncPrefsKey)
           : null;
     });
     await _configureHealth();
@@ -523,7 +523,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // also togglable from the home page).
   Future<void> _setAutoSync(bool enabled) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_autoSyncPrefsKey, enabled);
+    await prefs.setBool(autoSyncPrefsKey, enabled);
     if (!mounted) return;
     final firstDecision = _autoSyncEnabled == null;
     setState(() => _autoSyncEnabled = enabled);
