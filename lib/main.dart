@@ -10,9 +10,16 @@ import 'package:health/health.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:workmanager/workmanager.dart';
 
 import 'auth_service.dart';
-import 'background_sync.dart' show autoSyncPrefsKey, lastBackgroundSyncPrefsKey;
+import 'background_sync.dart'
+    show
+        androidSyncTaskName,
+        androidSyncUniqueName,
+        autoSyncPrefsKey,
+        lastBackgroundSyncPrefsKey,
+        workManagerCallbackDispatcher;
 import 'sync_service.dart';
 
 // Google Cloud Console OAuth 2.0 **web** client ID (the audience the server
@@ -326,7 +333,14 @@ class _HcRunDetailPage extends StatelessWidget {
   );
 }
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Android background sync runs through WorkManager; iOS uses its own
+  // BGTask/HealthKit path wired natively in AppDelegate, so it doesn't
+  // initialize WorkManager here.
+  if (Platform.isAndroid) {
+    await Workmanager().initialize(workManagerCallbackDispatcher);
+  }
   runApp(const XCTrainingApp());
 }
 
@@ -2395,6 +2409,9 @@ class _HomeScreenState extends State<HomeScreen> {
           // the entrypoint records each attempt for exactly this button.
           debugButton(Icons.bedtime, 'Last Background Sync', () async {
             final prefs = await SharedPreferences.getInstance();
+            // The record is written by the background isolate; reload so this
+            // (UI) isolate's cached copy picks up that out-of-process write.
+            await prefs.reload();
             final last = prefs.getString(lastBackgroundSyncPrefsKey);
             if (!mounted) return;
             setState(
@@ -2404,6 +2421,28 @@ class _HomeScreenState extends State<HomeScreen> {
             );
           }),
           const SizedBox(height: 8),
+          // Spike: enqueue a WorkManager one-off to prove Health Connect reads
+          // work in a headless isolate. WorkManager runs it within ~seconds;
+          // check "Last Background Sync" after.
+          if (Platform.isAndroid)
+            debugButton(
+              Icons.play_circle_outline,
+              'Run Background Sync (WorkManager)',
+              () async {
+                await Workmanager().registerOneOffTask(
+                  '$androidSyncUniqueName-test',
+                  androidSyncTaskName,
+                  existingWorkPolicy: ExistingWorkPolicy.replace,
+                );
+                if (!mounted) return;
+                setState(
+                  () => _status =
+                      'Enqueued a WorkManager sync. Wait a few seconds, then '
+                      'tap "Last Background Sync".',
+                );
+              },
+            ),
+          if (Platform.isAndroid) const SizedBox(height: 8),
           if (_permissionsGranted) ...[
             debugButton(
               Icons.history,

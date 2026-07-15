@@ -23,11 +23,18 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:health/health.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:workmanager/workmanager.dart';
 
 import 'auth_service.dart';
 import 'sync_service.dart';
 
 const String lastBackgroundSyncPrefsKey = 'last_background_sync';
+
+// Android WorkManager task identifiers. The unique name dedups the scheduled
+// work; the task name is echoed back to the callback (unused for now — there's
+// only one kind of task).
+const String androidSyncUniqueName = 'chadwick-periodic-sync';
+const String androidSyncTaskName = 'sync';
 
 // The user's automatic-upload choice (also the final onboarding step). Written
 // by the toggle in main.dart, read here to gate background syncs — background
@@ -93,4 +100,19 @@ Future<void> backgroundSync(List<String> args) async {
     // If the native side is already gone (task expired), there's no one to
     // tell — the expiration handler has completed the task for us.
   }
+}
+
+// Android WorkManager entrypoint. Registered via Workmanager().initialize in
+// main() (Android only — iOS uses the BGTask path above). WorkManager wakes a
+// headless isolate and calls this, which runs the shared body. Returning the
+// success bool lets WorkManager retry (per the task's backoff policy) on
+// failure.
+@pragma('vm:entry-point')
+void workManagerCallbackDispatcher() {
+  Workmanager().executeTask((taskName, inputData) async {
+    // executeTask initializes the widgets binding; the plugin registrant is
+    // needed too so the health / shared_preferences channels work here.
+    DartPluginRegistrant.ensureInitialized();
+    return runBackgroundSyncBody('workmanager:$taskName');
+  });
 }

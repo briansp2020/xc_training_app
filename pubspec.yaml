@@ -42,6 +42,7 @@ dependencies:
   geolocator: ^13.0.1 # only for Geolocator.distanceBetween (route distance math)
   flutter_map: ^7.0.2 # OpenStreetMap-based map for the run detail page
   latlong2: ^0.9.1 # LatLng type used by flutter_map
+  workmanager: ^0.9.0 # Android periodic background sync (iOS uses its own BGTask)
 
 dev_dependencies:
   flutter_test:
