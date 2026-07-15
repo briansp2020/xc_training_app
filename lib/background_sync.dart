@@ -17,6 +17,7 @@
 // ([lastBackgroundSyncPrefsKey]) so the debug page can show what happened —
 // background runs are otherwise invisible.
 
+import 'dart:io' show Platform;
 import 'dart:ui';
 
 import 'package:flutter/services.dart';
@@ -115,4 +116,27 @@ void workManagerCallbackDispatcher() {
     DartPluginRegistrant.ensureInitialized();
     return runBackgroundSyncBody('workmanager:$taskName');
   });
+}
+
+// Registers (or updates) the periodic Android background sync — WorkManager
+// wakes the app about every 15 min (its floor) when a network is available and
+// runs one sync. Idempotent: dedups by unique name, and `update` refreshes the
+// spec without disrupting timing. No-op on iOS, which uses the native BGTask
+// path. Call when the user is onboarded with automatic upload on.
+Future<void> scheduleAndroidSync() async {
+  if (!Platform.isAndroid) return;
+  await Workmanager().registerPeriodicTask(
+    androidSyncUniqueName,
+    androidSyncTaskName,
+    frequency: const Duration(minutes: 15),
+    constraints: Constraints(networkType: NetworkType.connected),
+    existingWorkPolicy: ExistingPeriodicWorkPolicy.update,
+  );
+}
+
+// Cancels the periodic background sync. Call when the user turns automatic
+// upload off or signs out. No-op on iOS.
+Future<void> cancelAndroidSync() async {
+  if (!Platform.isAndroid) return;
+  await Workmanager().cancelByUniqueName(androidSyncUniqueName);
 }

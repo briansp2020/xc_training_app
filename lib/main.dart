@@ -18,7 +18,9 @@ import 'background_sync.dart'
         androidSyncTaskName,
         androidSyncUniqueName,
         autoSyncPrefsKey,
+        cancelAndroidSync,
         lastBackgroundSyncPrefsKey,
+        scheduleAndroidSync,
         workManagerCallbackDispatcher;
 import 'sync_service.dart';
 
@@ -481,6 +483,9 @@ class _HomeScreenState extends State<HomeScreen> {
   void _afterSignedIn() {
     if (!_onboarded) return; // onboarding UI takes over
     if (_autoSyncEnabled == true && !_uploading) {
+      // Ensure the periodic background task exists (survives reboot, but a
+      // reinstall clears it) — idempotent, Android-only.
+      scheduleAndroidSync();
       _syncHealthData(); // calls _refreshPendingData when done
     } else {
       _refreshPendingData();
@@ -538,6 +543,12 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _setAutoSync(bool enabled) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(autoSyncPrefsKey, enabled);
+    // Start/stop periodic background sync to match the choice (Android-only).
+    if (enabled) {
+      await scheduleAndroidSync();
+    } else {
+      await cancelAndroidSync();
+    }
     if (!mounted) return;
     final firstDecision = _autoSyncEnabled == null;
     setState(() => _autoSyncEnabled = enabled);
@@ -630,6 +641,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Future<void> _signOut() async {
     await _auth.signOut();
+    // No token for the background isolate to use — stop the periodic task.
+    await cancelAndroidSync();
     if (!mounted) return;
     setState(() => _status = 'Signed out.');
   }
