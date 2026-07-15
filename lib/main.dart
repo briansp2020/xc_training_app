@@ -12,22 +12,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'auth_service.dart';
+import 'background_sync.dart' show lastBackgroundSyncPrefsKey;
 import 'sync_service.dart';
-
-// Server BASE URL (no trailing path). Override at run time:
-//   flutter run --dart-define-from-file=config/dev.json
-// (see config/dev.json.example for the schema). The default value below is
-// the Android emulator's alias for the host machine's localhost — safe as a
-// fall-back for someone freshly cloning the repo.
-//
-// Endpoints constructed from this base:
-//   $_serverBase/workouts          — health sync (POST)
-//   $_serverBase/auth/google       — exchange Google ID token → server JWT
-//   $_serverBase/auth/dev-login    — dev-only: email-based JWT (DEV_MODE=true)
-const String _serverBase = String.fromEnvironment(
-  'SERVER_URL',
-  defaultValue: 'http://10.0.2.2:8000',
-);
 
 // Google Cloud Console OAuth 2.0 **web** client ID (the audience the server
 // validates ID tokens against). Set via --dart-define-from-file=config/dev.json
@@ -378,16 +364,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
   final Health _health = Health();
   final AuthService _auth = AuthService(
-    serverBase: _serverBase,
+    serverBase: serverBase,
     googleServerClientId: _googleServerClientId,
   );
   // The UI-independent sync engine (see sync_service.dart) — the UI only
   // renders its progress strings and final result.
-  late final SyncService _sync = SyncService(
-    serverBase: _serverBase,
-    auth: _auth,
-    health: _health,
-  );
+  late final SyncService _sync = SyncService(auth: _auth, health: _health);
 
   String _status = 'Initializing Health Connect...';
   bool _configured = false;
@@ -504,7 +486,7 @@ class _HomeScreenState extends State<HomeScreen> {
       setState(() {
         _pendingSamples = -2; // server unreachable
         _lastSyncAt = null;
-        _status = 'Server unreachable at $_serverBase.';
+        _status = 'Server unreachable at $serverBase.';
       });
       return;
     }
@@ -1568,7 +1550,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
     try {
       final resp = await http
-          .delete(Uri.parse('$_serverBase/me/data'), headers: _auth.authHeaders)
+          .delete(Uri.parse('$serverBase/me/data'), headers: _auth.authHeaders)
           .timeout(const Duration(seconds: 60));
       if (!mounted) return;
       if (resp.statusCode == 401) {
@@ -2408,6 +2390,19 @@ class _HomeScreenState extends State<HomeScreen> {
             'Reset (wipe server + start over)',
             _resetSyncWatermark,
           ),
+          const SizedBox(height: 8),
+          // Background syncs run headlessly and are otherwise invisible —
+          // the entrypoint records each attempt for exactly this button.
+          debugButton(Icons.bedtime, 'Last Background Sync', () async {
+            final prefs = await SharedPreferences.getInstance();
+            final last = prefs.getString(lastBackgroundSyncPrefsKey);
+            if (!mounted) return;
+            setState(
+              () => _status = last == null
+                  ? 'No background sync has run yet.'
+                  : 'Last background sync:\n$last',
+            );
+          }),
           const SizedBox(height: 8),
           if (_permissionsGranted) ...[
             debugButton(

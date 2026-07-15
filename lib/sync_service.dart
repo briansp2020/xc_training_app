@@ -14,6 +14,22 @@ import 'package:http/http.dart' as http;
 
 import 'auth_service.dart';
 
+// Server BASE URL (no trailing path). Override at build/run time:
+//   flutter run --dart-define-from-file=config/dev.json
+// (see config/dev.json.example for the schema). The default value below is
+// the Android emulator's alias for the host machine's localhost — safe as a
+// fall-back for someone freshly cloning the repo.
+//
+// Endpoints constructed from this base:
+//   $serverBase/workouts          — health sync (POST)
+//   $serverBase/routes            — route upload (POST) + dedup listing (GET)
+//   $serverBase/auth/google       — exchange Google ID token → server JWT
+//   $serverBase/auth/dev-login    — dev-only: email-based JWT (DEV_MODE=true)
+const String serverBase = String.fromEnvironment(
+  'SERVER_URL',
+  defaultValue: 'http://10.0.2.2:8000',
+);
+
 // Server attributes uploads to the athlete in the Bearer token; this field
 // is now deprecated and ignored, but kept in the payload so older server
 // builds still parse the request.
@@ -88,10 +104,9 @@ typedef RouteUploadResult = ({
 });
 
 class SyncService {
-  SyncService({required this.serverBase, required this.auth, Health? health})
+  SyncService({required this.auth, Health? health})
     : health = health ?? Health();
 
-  final String serverBase;
   final AuthService auth;
   final Health health;
 

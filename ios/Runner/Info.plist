@@ -53,6 +53,18 @@
 	<string>210202837170-qkbmq2a7j90ekfkdr0srj2k54mklsslr.apps.googleusercontent.com</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+
+	<!-- Background sync: iOS wakes the app via BGAppRefreshTask (registered in
+	     AppDelegate) and a headless Dart isolate runs one SyncService.sync().
+	     The identifier must match AppDelegate.syncTaskId. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>fetch</string>
+	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.github.codingwithwarren.xctraining.sync</string>
+	</array>
 	<key>NSHealthShareUsageDescription</key>
 	<string>Chadwick XC Training reads your recorded workouts — and the heart rate, distance, energy, and GPS route around each one — from Apple Health to share with your team. Nothing outside your workouts is read.</string>
 	<key>UIApplicationSceneManifest</key>

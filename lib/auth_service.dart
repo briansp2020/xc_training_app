@@ -22,10 +22,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// preemptively soft-expires after 25 days so we don't burn a sync attempt
 /// on a token the server is about to reject.
 class AuthService {
-  AuthService({
-    required this.serverBase,
-    required this.googleServerClientId,
-  });
+  AuthService({required this.serverBase, required this.googleServerClientId});
 
   /// Server base URL — no trailing path. Auth endpoints live at
   /// `$serverBase/auth/...`.
