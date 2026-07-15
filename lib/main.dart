@@ -5,7 +5,6 @@ import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show MethodChannel;
 import 'package:flutter_map/flutter_map.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:health/health.dart';
 import 'package:http/http.dart' as http;
@@ -13,6 +12,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'auth_service.dart';
+import 'sync_service.dart';
 
 // Server BASE URL (no trailing path). Override at run time:
 //   flutter run --dart-define-from-file=config/dev.json
@@ -38,32 +38,6 @@ const String _googleServerClientId = String.fromEnvironment(
   defaultValue: '',
 );
 
-// Server attributes uploads to the athlete in the Bearer token; this field
-// is now deprecated and ignored, but kept in the payload so older server
-// builds still parse the request.
-const int _athleteId = 1;
-
-// Reported in every sync payload so the server can tell which client emitted
-// it. Must match `version` in pubspec.yaml — bump both together.
-const String _clientVersion = '1.0.0+1';
-
-// When the server has no data for this athlete yet, the first sync uploads
-// this much history. Afterwards each sync asks the server for the newest
-// sample it has (GET /me/last-sample-time) and uploads from there — the
-// server is the single source of truth, so reinstalls and second devices
-// resume where the data actually ends.
-const Duration _firstSyncWindow = Duration(hours: 24);
-
-// How far back the Runs tab and the debug export look. Deliberately wider
-// than the first-sync upload window — showing a month of history is useful
-// even though uploads default to the last day.
-const Duration _historyWindow = Duration(days: 30);
-
-// The app uploads workout data only: continuous streams (HR, steps, distance,
-// calories) are read solely within this padding around each recorded workout.
-// The padding keeps warm-up / cool-down context for HR-recovery analysis.
-const Duration _workoutPadding = Duration(minutes: 10);
-
 // Distances display in miles (US team). Health Connect stores meters.
 const double _metersPerMile = 1609.344;
 
@@ -79,15 +53,6 @@ const String _autoSyncPrefsKey = 'auto_sync_enabled';
 // plugin's hasPermissions returns null for reads), so without this flag every
 // cold launch would treat permissions as missing and re-show onboarding.
 const String _healthPermsRequestedPrefsKey = 'health_perms_requested';
-
-// Re-query an overlap behind the watermark on every incremental sync, to catch
-// late-arriving Health Connect samples. The watermark is a single global max
-// across all streams, so live HR pins it near "now"; but Fitbit derives resting
-// HR, HRV, and sleep from overnight data and delivers them hours late, with a
-// dateTo well behind that global max. A 1h overlap missed them — use 24h so a
-// late-delivered sample still falls inside the next sync's window. The server's
-// UUID upsert dedup makes the wider re-query harmless.
-const Duration _watermarkOverlap = Duration(hours: 24);
 
 // Moving-average window for smoothing the *displayed* GPS path — tames the
 // zigzag from GPS jitter. Raw points are kept intact; only the drawn polyline
@@ -111,29 +76,6 @@ List<LatLng> smoothPath(List<LatLng> pts, {int window = _pathSmoothingWindow}) {
     out.add(LatLng(lat / n, lng / n));
   }
   return out;
-}
-
-// On iOS the health plugin maps several Android-only names onto a single
-// HKWorkoutActivityType (RUNNING_TREADMILL → .running, ROCK_CLIMBING →
-// .climbing, SWIMMING_POOL / SWIMMING_OPEN_WATER → .swimming) and reverse-maps
-// on read with first(where:) over an *unordered* Swift dictionary — so a plain
-// outdoor run can come back labeled RUNNING_TREADMILL at random. HealthKit
-// can't even express those distinctions in the activity type, so on iOS
-// collapse the aliases to their canonical names. Android's are real distinct
-// Health Connect types — leave them alone.
-String _canonicalActivityType(String name) {
-  if (!Platform.isIOS) return name;
-  switch (name) {
-    case 'RUNNING_TREADMILL':
-      return 'RUNNING';
-    case 'ROCK_CLIMBING':
-      return 'CLIMBING';
-    case 'SWIMMING_POOL':
-    case 'SWIMMING_OPEN_WATER':
-      return 'SWIMMING';
-    default:
-      return name;
-  }
 }
 
 // One logical run assembled from Health Connect workouts. Multiple apps often
@@ -186,7 +128,7 @@ class _HcRun {
     for (final m in members) {
       final v = m.value;
       if (v is WorkoutHealthValue && v.workoutActivityType.name != 'OTHER') {
-        return _canonicalActivityType(v.workoutActivityType.name);
+        return canonicalActivityType(v.workoutActivityType.name);
       }
     }
     if (Platform.isAndroid && hasRoute && (mph ?? 0) > 3.5) {
@@ -439,6 +381,13 @@ class _HomeScreenState extends State<HomeScreen> {
     serverBase: _serverBase,
     googleServerClientId: _googleServerClientId,
   );
+  // The UI-independent sync engine (see sync_service.dart) — the UI only
+  // renders its progress strings and final result.
+  late final SyncService _sync = SyncService(
+    serverBase: _serverBase,
+    auth: _auth,
+    health: _health,
+  );
 
   String _status = 'Initializing Health Connect...';
   bool _configured = false;
@@ -542,29 +491,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // Asks the server for the newest sample timestamp it has for this athlete
-  // (GET /me/last-sample-time) — the sync watermark. Returns null when the
-  // server has no data yet (first sync, or right after a data reset). Throws
-  // on any failure; a 401 also drops the token so the sign-in card returns.
-  Future<DateTime?> _fetchServerWatermark() async {
-    final resp = await http
-        .get(
-          Uri.parse('$_serverBase/me/last-sample-time'),
-          headers: _auth.authHeaders,
-        )
-        .timeout(const Duration(seconds: 30));
-    if (resp.statusCode == 401) {
-      await _auth.invalidate();
-      throw Exception('Sign-in expired. Please sign in again.');
-    }
-    if (resp.statusCode < 200 || resp.statusCode >= 300) {
-      throw Exception('Server returned ${resp.statusCode}');
-    }
-    final t =
-        (jsonDecode(resp.body) as Map<String, dynamic>)['last_sample_time'];
-    return t == null ? null : DateTime.parse(t as String).toLocal();
-  }
-
   // Recomputes the home page's upload status: how many recorded workouts are
   // newer than the server's watermark. Only workout data uploads, so between
   // workouts the app is legitimately "all caught up" — continuous HR must not
@@ -573,7 +499,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!_onboarded || !_auth.isSignedIn) return;
     setState(() => _pendingSamples = null); // check in progress
     // Fail fast on a down server instead of hanging the 30s watermark fetch.
-    if (!await _serverReachable()) {
+    if (!await _sync.serverReachable()) {
       if (!mounted) return;
       setState(() {
         _pendingSamples = -2; // server unreachable
@@ -584,7 +510,7 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     final DateTime? last;
     try {
-      last = await _fetchServerWatermark();
+      last = await _sync.fetchServerWatermark();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -603,7 +529,7 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
     final now = DateTime.now();
-    final workouts = await _safeRead(HealthDataType.WORKOUT, last, now);
+    final workouts = await _sync.safeRead(HealthDataType.WORKOUT, last, now);
     if (!mounted) return;
     setState(() {
       _pendingSamples = workouts.length;
@@ -1094,7 +1020,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       final results = <HealthDataType, List<HealthDataPoint>>{};
       for (final t in allTypes) {
-        results[t] = await _safeRead(t, thirtyDaysAgo, now);
+        results[t] = await _sync.safeRead(t, thirtyDaysAgo, now);
       }
 
       debugPrint('\nPer-type summary (count, sources):');
@@ -1207,14 +1133,14 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _exportToFile() async {
     setState(() {
       _uploading = true;
-      _status = 'Reading ${_historyWindow.inDays} days for export...';
+      _status = 'Reading ${historyWindow.inDays} days for export...';
     });
 
     try {
       final now = DateTime.now();
-      final windowStart = now.subtract(_historyWindow);
+      final windowStart = now.subtract(historyWindow);
 
-      final built = await _buildSyncPayload(
+      final built = await _sync.buildSyncPayload(
         windowStart,
         now,
         labelSuffix: ' (export)',
@@ -1499,496 +1425,33 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  Map<String, dynamic> _numericSample(HealthDataPoint p) {
-    final v = p.value;
-    return {
-      'uuid': p.uuid,
-      'time': p.dateFrom.toUtc().toIso8601String(),
-      'value': v is NumericHealthValue ? v.numericValue : null,
-      'unit': p.unit.name,
-      'source': p.sourceName,
-      'recording_method': p.recordingMethod.name,
-    };
-  }
-
-  Map<String, dynamic> _intervalSample(HealthDataPoint p) {
-    final v = p.value;
-    return {
-      'uuid': p.uuid,
-      'start': p.dateFrom.toUtc().toIso8601String(),
-      'end': p.dateTo.toUtc().toIso8601String(),
-      'value': v is NumericHealthValue ? v.numericValue : null,
-      'unit': p.unit.name,
-      'source': p.sourceName,
-      'recording_method': p.recordingMethod.name,
-    };
-  }
-
-  // Max time span per Health Connect query. The plugin serializes each read's
-  // ENTIRE result into one method-channel envelope on the Java heap; a full
-  // 30-day window of heart-rate data (165k+ samples) OOM-crashed the app even
-  // with largeHeap, so long windows are read in slices this wide and stitched
-  // together on the Dart side.
-  static const Duration _readChunk = Duration(days: 3);
-
-  Future<List<HealthDataPoint>> _safeRead(
-    HealthDataType t,
-    DateTime start,
-    DateTime end,
-  ) async {
-    final out = <HealthDataPoint>[];
-    // Records overlapping a slice boundary are returned by both slices —
-    // dedup by uuid so callers see each record once.
-    final seen = <String>{};
-    var cursor = start;
-    while (cursor.isBefore(end)) {
-      var sliceEnd = cursor.add(_readChunk);
-      if (sliceEnd.isAfter(end)) sliceEnd = end;
-      try {
-        final slice = await _health.getHealthDataFromTypes(
-          types: [t],
-          startTime: cursor,
-          endTime: sliceEnd,
-        );
-        for (final p in slice) {
-          if (seen.add(p.uuid)) out.add(p);
-        }
-      } catch (e, st) {
-        // Don't crash the caller — expected for unpermissioned types — but
-        // log so it's still visible in the dev console.
-        debugPrint('[_safeRead] ${t.name} $cursor..$sliceEnd failed: $e\n$st');
-      }
-      cursor = sliceEnd;
-    }
-    return out;
-  }
-
-  // Streams uploaded in full across the entire sync window — independent of
-  // any workout container. The server detects exercise sessions from the
-  // raw HR + step traces, so we need everything inside the window regardless
-  // of whether Fitbit wrapped it in an ExerciseSessionRecord.
-  //
-  // Every type in these maps MUST be in `_types` (and the manifest must
-  // declare the matching READ_* permission), or the read returns empty.
-  static const Map<String, HealthDataType> _numericStreams = {
-    'heart_rate_samples': HealthDataType.HEART_RATE,
-  };
-
-  static const Map<String, HealthDataType> _intervalStreams = {
-    'step_samples': HealthDataType.STEPS,
-    'distance_samples': HealthDataType.DISTANCE_DELTA,
-    'total_calorie_samples': HealthDataType.TOTAL_CALORIES_BURNED,
-    'active_energy_samples': HealthDataType.ACTIVE_ENERGY_BURNED,
-  };
-
-  /// Reads workouts over [windowStart, now] and assembles the `health_sync`
-  /// payload. The app uploads **workout data only** (privacy decision,
-  /// 2026-07): the continuous streams (HR, steps, distance, calories) are
-  /// read solely within ±[_workoutPadding] of each recorded workout — nothing
-  /// between workouts ever leaves the phone. Shared by sync and export so the
-  /// two can't drift (a past divergence here caused an OOM). Updates `_status`
-  /// per stream; [labelSuffix] distinguishes the caller in that text.
-  ///
-  /// Reads one stream per query on purpose — batching all types into a single
-  /// getHealthDataFromTypes call makes the health plugin serialize the whole
-  /// result across the method channel in one allocation, and a full window of
-  /// ~165k HR samples OOMs the Java heap.
-  Future<({Map<String, dynamic> payload, int totalSamples})> _buildSyncPayload(
-    DateTime windowStart,
-    DateTime now, {
-    String labelSuffix = '',
-  }) async {
-    // Workouts use the package's special WORKOUT path (it aggregates
-    // distance/calories/steps from related records). Separate read.
-    final workouts = await _safeRead(HealthDataType.WORKOUT, windowStart, now);
-
-    // Padded, merged time ranges around the recorded workouts — the only
-    // ranges the continuous streams are read from. Merging keeps overlapping
-    // paddings (back-to-back or double-recorded workouts) as one range.
-    final sorted = [...workouts]
-      ..sort((a, b) => a.dateFrom.compareTo(b.dateFrom));
-    final windows = <({DateTime start, DateTime end})>[];
-    for (final w in sorted) {
-      final s = w.dateFrom.subtract(_workoutPadding);
-      final e = w.dateTo.add(_workoutPadding);
-      if (windows.isNotEmpty && !s.isAfter(windows.last.end)) {
-        if (e.isAfter(windows.last.end)) {
-          windows.last = (start: windows.last.start, end: e);
-        }
-      } else {
-        windows.add((start: s, end: e));
-      }
-    }
-
-    // Reads one stream across all workout windows, deduping records that
-    // straddle two adjacent ranges.
-    Future<List<HealthDataPoint>> readAroundWorkouts(HealthDataType t) async {
-      final seen = <String>{};
-      final out = <HealthDataPoint>[];
-      for (final win in windows) {
-        for (final p in await _safeRead(t, win.start, win.end)) {
-          if (seen.add('${p.uuid}/${p.dateFrom.microsecondsSinceEpoch}')) {
-            out.add(p);
-          }
-        }
-      }
-      return out;
-    }
-
-    final workoutPayloads = workouts.map((w) {
-      final wv = w.value is WorkoutHealthValue
-          ? w.value as WorkoutHealthValue
-          : null;
-      return <String, dynamic>{
-        'source_uuid': w.uuid,
-        'source_app': w.sourceName,
-        'source_device_id': w.sourceDeviceId,
-        'activity_type': _canonicalActivityType(
-          wv?.workoutActivityType.name ?? 'OTHER',
-        ),
-        'recording_method': w.recordingMethod.name,
-        'start_time': w.dateFrom.toUtc().toIso8601String(),
-        'end_time': w.dateTo.toUtc().toIso8601String(),
-        'duration_seconds': w.dateTo.difference(w.dateFrom).inSeconds,
-        'total_distance_meters': wv?.totalDistance,
-        'total_energy_kcal': wv?.totalEnergyBurned,
-        'total_steps': wv?.totalSteps,
-      };
-    }).toList();
-
-    final payload = <String, dynamic>{
-      'type': 'health_sync',
-      'athlete_id': _athleteId,
-      'client_version': _clientVersion,
-      'uploaded_at': now.toUtc().toIso8601String(),
-      'source_platform': 'googleHealthConnect',
-      'window_start': windowStart.toUtc().toIso8601String(),
-      'window_end': now.toUtc().toIso8601String(),
-      'workouts': workoutPayloads,
-    };
-
-    var totalSamples = 0;
-    for (final e in _numericStreams.entries) {
-      if (mounted) setState(() => _status = 'Reading ${e.key}$labelSuffix...');
-      final samples = await readAroundWorkouts(e.value);
-      payload[e.key] = samples.map(_numericSample).toList();
-      totalSamples += samples.length;
-    }
-    for (final e in _intervalStreams.entries) {
-      if (mounted) setState(() => _status = 'Reading ${e.key}$labelSuffix...');
-      final samples = await readAroundWorkouts(e.value);
-      payload[e.key] = samples.map(_intervalSample).toList();
-      totalSamples += samples.length;
-    }
-
-    return (payload: payload, totalSamples: totalSamples);
-  }
-
-  // [backfill] (debug): ignore the server watermark and upload the full
-  // _historyWindow. Safe to repeat — the server's composite-key upsert
-  // dedups everything; the payload carries "backfill": true so the server
-  // can tell this overlap is deliberate.
-  // Quick liveness probe so a down/unreachable server fails in ~5s with a
-  // clear message, instead of hanging the full 120s upload timeout on a dead
-  // connection. Any HTTP response (even 404) means the server answered; only a
-  // socket error or the short timeout counts as unreachable.
-  Future<bool> _serverReachable() async {
-    try {
-      await http
-          .get(Uri.parse('$_serverBase/'))
-          .timeout(const Duration(seconds: 5));
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
   Future<void> _syncHealthData({bool backfill = false}) async {
     setState(() {
       _uploading = true;
       _status = 'Checking server...';
     });
-
-    // Fail fast when the server is down instead of hanging on the upload.
-    if (!await _serverReachable()) {
-      if (!mounted) return;
-      setState(() {
-        _uploading = false;
-        // Drive the home status to the "unreachable" line; otherwise it falls
-        // back to the stale _pendingSamples value ("Checking for new data…").
-        _pendingSamples = -2;
-        _status =
-            'Server unreachable at $_serverBase.\n'
-            'Check it is running and on the same network, then re-tap Sync.';
-      });
-      return;
-    }
+    final result = await _sync.sync(
+      backfill: backfill,
+      onProgress: (msg) {
+        if (mounted) setState(() => _status = msg);
+      },
+    );
     if (!mounted) return;
-    setState(() => _status = 'Reading data from Health Connect...');
-
-    try {
-      final now = DateTime.now();
-      final DateTime windowStart;
-      final String windowLabel;
-      if (backfill) {
-        windowStart = now.subtract(_historyWindow);
-        windowLabel = 'backfill (${_historyWindow.inDays} days)';
-      } else {
-        setState(() => _status = 'Checking what the server already has...');
-        final serverWatermark = await _fetchServerWatermark();
-        if (!mounted) return;
-        setState(() => _status = 'Reading data from Health Connect...');
-        windowStart = serverWatermark != null
-            ? serverWatermark.subtract(_watermarkOverlap)
-            : now.subtract(_firstSyncWindow);
-        final windowDays = now.difference(windowStart).inMinutes / (60 * 24);
-        windowLabel = serverWatermark != null
-            ? 'since last sync (${windowDays.toStringAsFixed(1)} days)'
-            : 'full ${_firstSyncWindow.inHours}-hour window (first sync)';
-      }
-
-      final built = await _buildSyncPayload(windowStart, now);
-      if (!mounted) return;
-      final payload = built.payload;
-      if (backfill) payload['backfill'] = true;
-      final totalSamples = built.totalSamples;
-      final workoutCount = (payload['workouts'] as List).length;
-
-      final bodyBytes = utf8.encode(jsonEncode(payload));
-      final sizeMB = (bodyBytes.length / 1024 / 1024).toStringAsFixed(2);
-      setState(
-        () => _status =
-            'Uploading $workoutCount workouts + $totalSamples samples ($sizeMB MB)...',
-      );
-
-      final response = await http
-          .post(
-            Uri.parse('$_serverBase/workouts'),
-            headers: {'Content-Type': 'application/json', ..._auth.authHeaders},
-            body: bodyBytes,
-          )
-          .timeout(const Duration(seconds: 120));
-      if (!mounted) return;
-
-      final ok = response.statusCode >= 200 && response.statusCode < 300;
-      // No watermark to persist — the server derives it from the data it
-      // just ingested, and the next sync asks for it again.
-
-      // 401 → token rejected. Drop it so the next sync attempt forces
-      // sign-in, and show the auth card again instead of a noisy error.
-      if (response.statusCode == 401) {
-        await _auth.invalidate();
-        if (!mounted) return;
-        setState(() {
-          _uploading = false;
-          _status = 'Sign-in expired. Please sign in again, then re-tap Sync.';
-        });
-        return;
-      }
-
-      // Also upload any GPS routes other apps attached to their workouts
-      // (Fitbit / Pixel Watch / Apple Watch runs). Independent of the health
-      // upload above — see SERVER_SCHEMA.md "Route tracks".
-      //
-      // Deliberately NOT the incremental sample window: the watermark rides
-      // the continuous HR stream, so a route that wasn't readable during the
-      // sync right after its run (route permission granted later, Watch
-      // delivered the route late) would fall behind the watermark and never
-      // be scanned again. Routes are few, so always scan the full history
-      // window — dedup against the server's route list keeps it idempotent.
-      setState(() => _status = 'Uploading workout routes...');
-      final hcRoutes = await _uploadHealthConnectRoutes(
-        now.subtract(_historyWindow),
-        now,
-      );
-      if (!mounted) return;
-      if (hcRoutes.unauthorized) {
-        await _auth.invalidate();
-        if (!mounted) return;
-        setState(() {
-          _uploading = false;
-          _status = 'Sign-in expired. Please sign in again, then re-tap Sync.';
-        });
-        return;
-      }
-
-      final routeMsg = (hcRoutes.uploaded == 0 && hcRoutes.failed == 0)
-          ? ' No new routes.'
-          : ' Routes: ${hcRoutes.uploaded} uploaded'
-                '${hcRoutes.failed > 0 ? ", ${hcRoutes.failed} failed" : ""}.';
-      final consentMsg = hcRoutes.pendingConsent > 0
-          ? '\n${hcRoutes.pendingConsent} Health Connect route(s) unreadable — '
-                'grant "Exercise routes → Always allow" in Health Connect → '
-                'App permissions → Chadwick XC Training, then Sync again.'
-          : '';
-      setState(() {
-        _uploading = false;
-        if (ok) {
-          _status =
-              'Synced $sizeMB MB ($windowLabel): $workoutCount workouts, $totalSamples samples. Server: ${response.statusCode}.$routeMsg$consentMsg';
-        } else {
-          _status =
-              'Health upload failed: ${response.statusCode}.$routeMsg$consentMsg\n${response.body}';
-        }
-      });
-      _refreshPendingData(); // recompute the home page's upload status
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _uploading = false;
-        _status = 'Sync error: $e';
-      });
+    setState(() {
+      _uploading = false;
+      _status = result.message;
+      // Drive the home status to the "unreachable" line; otherwise it falls
+      // back to the stale _pendingSamples value ("Checking for new data…").
+      if (result.status == SyncStatus.unreachable) _pendingSamples = -2;
+    });
+    // On unauthorized the token was dropped — the sign-in card takes over;
+    // unreachable was handled above. Everything else recomputes the home
+    // page's upload status.
+    if (result.status == SyncStatus.ok ||
+        result.status == SyncStatus.httpError ||
+        result.status == SyncStatus.error) {
       _refreshPendingData();
     }
-  }
-
-  // Uploads GPS routes that OTHER apps (Fitbit, Pixel Watch, Apple Watch...)
-  // attached to their workouts, as route_track payloads to POST /routes.
-  // Routes the user hasn't consented to yet read back with no locations
-  // (ConsentRequired) — counted in pendingConsent so the status can tell the
-  // user to grant "Exercise routes" in Health Connect's app permissions.
-  Future<({int uploaded, int failed, int pendingConsent, bool unauthorized})>
-  _uploadHealthConnectRoutes(DateTime windowStart, DateTime now) async {
-    // Dedup against the server, like the sample watermark — the server is the
-    // source of truth for what it already has. A local list would go stale on
-    // a server-side wipe (routes never re-sent) or an app reinstall.
-    final Set<String> done;
-    try {
-      final resp = await http
-          .get(Uri.parse('$_serverBase/routes'), headers: _auth.authHeaders)
-          .timeout(const Duration(seconds: 30));
-      if (resp.statusCode == 401) {
-        return (uploaded: 0, failed: 0, pendingConsent: 0, unauthorized: true);
-      }
-      if (resp.statusCode < 200 || resp.statusCode >= 300) {
-        throw Exception('server returned ${resp.statusCode}');
-      }
-      done = {
-        for (final r in jsonDecode(resp.body) as List)
-          (r as Map<String, dynamic>)['client_route_id'] as String,
-      };
-    } catch (e) {
-      // Can't know what the server has — skip route upload this sync rather
-      // than re-send everything; surfaced as a failure so it isn't silent.
-      debugPrint('[hc-routes] listing server routes failed: $e');
-      return (uploaded: 0, failed: 1, pendingConsent: 0, unauthorized: false);
-    }
-
-    final points = await _safeRead(
-      HealthDataType.WORKOUT_ROUTE,
-      windowStart,
-      now,
-    );
-    var uploaded = 0;
-    var failed = 0;
-    var pendingConsent = 0;
-    for (final r in points) {
-      final v = r.value;
-      if (v is! WorkoutRouteHealthValue) continue;
-      // The workout uuid is the stable identity of the route (and what the
-      // server can join against the workouts table); fall back to the record
-      // uuid if the package didn't surface it.
-      final id = v.workoutUuid ?? r.uuid;
-      if (done.contains(id)) continue;
-      if (v.locations.isEmpty) {
-        pendingConsent++;
-        continue;
-      }
-      // iOS: the health plugin never surfaces the parent workout's uuid for a
-      // route (Android does), and the server joins routes to workouts on
-      // source_workout_uuid — a null leaves the route orphaned. Recover the
-      // uuid by time overlap with the workout it belongs to.
-      var workoutUuid = v.workoutUuid;
-      if (workoutUuid == null) {
-        final nearby = await _safeRead(
-          HealthDataType.WORKOUT,
-          r.dateFrom.subtract(const Duration(minutes: 10)),
-          r.dateTo.add(const Duration(minutes: 10)),
-        );
-        for (final w in nearby) {
-          if (w.value is! WorkoutHealthValue) continue;
-          if (w.dateFrom.isBefore(r.dateTo) && w.dateTo.isAfter(r.dateFrom)) {
-            workoutUuid = w.uuid;
-            break;
-          }
-        }
-      }
-      final locs = v.locations;
-      var dist = 0.0;
-      for (var i = 1; i < locs.length; i++) {
-        dist += Geolocator.distanceBetween(
-          locs[i - 1].latitude,
-          locs[i - 1].longitude,
-          locs[i].latitude,
-          locs[i].longitude,
-        );
-      }
-      final payload = {
-        'type': 'route_track',
-        'client_route_id': id,
-        'source': 'health_connect',
-        'source_workout_uuid': workoutUuid,
-        'recorded_at': now.toUtc().toIso8601String(),
-        'start_time': r.dateFrom.toUtc().toIso8601String(),
-        'end_time': r.dateTo.toUtc().toIso8601String(),
-        'duration_seconds': r.dateTo.difference(r.dateFrom).inSeconds,
-        'distance_meters': dist,
-        'point_count': locs.length,
-        'points': [
-          for (final p in locs)
-            {
-              'lat': p.latitude,
-              'lng': p.longitude,
-              'time': p.timestamp.toUtc().toIso8601String(),
-              'accuracy_m': p.horizontalAccuracy,
-              'altitude_m': p.altitude,
-              'speed_mps': p.speed, // null on Android — HC routes omit speed
-            },
-        ],
-      };
-      try {
-        final resp = await http
-            .post(
-              Uri.parse('$_serverBase/routes'),
-              headers: {
-                'Content-Type': 'application/json',
-                ..._auth.authHeaders,
-              },
-              body: jsonEncode(payload),
-            )
-            .timeout(const Duration(seconds: 60));
-        if (resp.statusCode == 401) {
-          return (
-            uploaded: uploaded,
-            failed: failed,
-            pendingConsent: pendingConsent,
-            unauthorized: true,
-          );
-        }
-        if (resp.statusCode >= 200 && resp.statusCode < 300) {
-          done.add(id);
-          uploaded++;
-        } else if (resp.statusCode == 409) {
-          // Server already has this client_route_id and won't upsert —
-          // treat as synced so it isn't retried forever.
-          done.add(id);
-        } else {
-          debugPrint(
-            '[hc-routes] $id rejected: ${resp.statusCode} ${resp.body}',
-          );
-          failed++;
-        }
-      } catch (e) {
-        debugPrint('[hc-routes] upload of $id failed: $e');
-        failed++; // network/timeout — retried next sync
-      }
-    }
-    return (
-      uploaded: uploaded,
-      failed: failed,
-      pendingConsent: pendingConsent,
-      unauthorized: false,
-    );
   }
 
   // Marks the route-access onboarding step complete (granted or skipped).
@@ -2025,7 +1488,7 @@ class _HomeScreenState extends State<HomeScreen> {
       }
       // Fall back to per-route consent for the first blocked route.
       final now = DateTime.now();
-      final points = await _safeRead(
+      final points = await _sync.safeRead(
         HealthDataType.WORKOUT_ROUTE,
         now.subtract(const Duration(days: 30)),
         now,
@@ -2079,7 +1542,7 @@ class _HomeScreenState extends State<HomeScreen> {
         content: Text(
           'This deletes ALL data uploaded for your account on the server '
           'and resets local sync state. The next Sync re-uploads the full '
-          '${_firstSyncWindow.inHours}-hour window and all saved routes.',
+          '${firstSyncWindow.inHours}-hour window and all saved routes.',
         ),
         actions: [
           TextButton(
@@ -2137,7 +1600,7 @@ class _HomeScreenState extends State<HomeScreen> {
         _status =
             'Server data deleted: ${resp.body}\nLocal sync state '
             'cleared — next Sync re-uploads the full '
-            '${_firstSyncWindow.inHours}-hour window + all routes.';
+            '${firstSyncWindow.inHours}-hour window + all routes.';
       });
     } catch (e) {
       if (!mounted) return;
@@ -2535,9 +1998,9 @@ class _HomeScreenState extends State<HomeScreen> {
   // groups time-overlapping ones into logical runs — see _HcRun.
   Future<List<_HcRun>> _loadHcRuns() async {
     final now = DateTime.now();
-    final workouts = await _safeRead(
+    final workouts = await _sync.safeRead(
       HealthDataType.WORKOUT,
-      now.subtract(_historyWindow),
+      now.subtract(historyWindow),
       now,
     );
     workouts.sort((a, b) => a.dateFrom.compareTo(b.dateFrom));
@@ -2554,9 +2017,9 @@ class _HomeScreenState extends State<HomeScreen> {
     // heuristic in _HcRun.activityType. Matched by workout uuid, falling
     // back to time overlap (route records exist even when consent blocks
     // reading their points).
-    final routes = await _safeRead(
+    final routes = await _sync.safeRead(
       HealthDataType.WORKOUT_ROUTE,
-      now.subtract(_historyWindow),
+      now.subtract(historyWindow),
       now,
     );
     for (final p in routes) {
@@ -2665,7 +2128,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<({List<LatLng>? points, bool consentBlocked})> _routeForRun(
     _HcRun run,
   ) async {
-    final records = await _safeRead(
+    final records = await _sync.safeRead(
       HealthDataType.WORKOUT_ROUTE,
       run.start.subtract(const Duration(minutes: 5)),
       run.end.add(const Duration(minutes: 5)),
@@ -2698,7 +2161,11 @@ class _HomeScreenState extends State<HomeScreen> {
     // Average / max heart rate over the run window, if any HR was recorded.
     int? avgHr, maxHr;
     try {
-      final hr = await _safeRead(HealthDataType.HEART_RATE, run.start, run.end);
+      final hr = await _sync.safeRead(
+        HealthDataType.HEART_RATE,
+        run.start,
+        run.end,
+      );
       final bpms = <double>[
         for (final p in hr)
           if (p.value is NumericHealthValue)
@@ -2804,7 +2271,7 @@ class _HomeScreenState extends State<HomeScreen> {
       statusIcon = Icons.cloud_off;
       statusLine =
           'Nothing uploaded yet — tap Sync to upload your last '
-          '${_firstSyncWindow.inHours} hours.';
+          '${firstSyncWindow.inHours} hours.';
     } else if (pending == 0) {
       statusIcon = Icons.cloud_done;
       statusLine = 'All data uploaded.';
@@ -2945,7 +2412,7 @@ class _HomeScreenState extends State<HomeScreen> {
           if (_permissionsGranted) ...[
             debugButton(
               Icons.history,
-              'Upload Past ${_historyWindow.inDays} Days (backfill)',
+              'Upload Past ${historyWindow.inDays} Days (backfill)',
               () {
                 if (!_uploading) _syncHealthData(backfill: true);
               },
