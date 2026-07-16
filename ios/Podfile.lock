@@ -2,20 +2,26 @@ PODS:
   - Flutter (1.0.0)
   - health (13.3.1):
     - Flutter
+  - workmanager_apple (0.0.1):
+    - Flutter
 
 DEPENDENCIES:
   - Flutter (from `Flutter`)
   - health (from `.symlinks/plugins/health/ios`)
+  - workmanager_apple (from `.symlinks/plugins/workmanager_apple/ios`)
 
 EXTERNAL SOURCES:
   Flutter:
     :path: Flutter
   health:
     :path: ".symlinks/plugins/health/ios"
+  workmanager_apple:
+    :path: ".symlinks/plugins/workmanager_apple/ios"
 
 SPEC CHECKSUMS:
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
   health: 4decf5d74e8f54c58a8c07a385fc72f629a831d9
+  workmanager_apple: 904529ae31e97fc5be632cf628507652294a0778
 
 PODFILE CHECKSUM: 4dc69e07b0e1b218e2b4c508187ee9a08e5bfff3
 
